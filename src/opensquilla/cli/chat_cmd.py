@@ -50,12 +50,22 @@ def run_chat(
         help="Restrict read-side file tools to --workspace in standalone mode",
     ),
     timeout: float | None = None,
+    restart_gateway: bool = typer.Option(
+        False,
+        "--restart-gateway",
+        help="Restart (or start) the gateway daemon before connecting. "
+        "Use after config edits that only take effect on a full restart.",
+    ),
 ) -> None:
     """Start interactive chat with the agent.
 
     Default: connects to the running gateway daemon for full features
     (tools, skills, session persistence). Use --standalone for direct
     TurnRunner mode without a gateway daemon.
+
+    ``--restart-gateway`` restarts the managed daemon (or starts it if it is
+    not running) using the active profile's config, then connects. It is
+    ignored in ``--standalone`` mode.
     """
     _run_chat_request(
         _ChatCommandRequest(
@@ -66,9 +76,28 @@ def run_chat(
             workspace=workspace,
             workspace_strict=workspace_strict,
             timeout=timeout,
+            # Guard against programmatic callers passing the raw typer
+            # OptionInfo default (truthy) instead of a real bool.
+            restart_gateway=restart_gateway is True,
         ),
         module_globals=globals(),
     )
+
+
+def _restart_gateway_before_chat() -> None:
+    """Restart the gateway daemon (or start it if not running) before connecting."""
+    from opensquilla.cli.chat.gateway_runtime import restart_gateway_daemon
+
+    result = restart_gateway_daemon()
+    if result.ok:
+        detail = f" (pid={result.pid})" if result.pid else ""
+        typer.echo(f"Gateway {result.state}: {result.message}{detail}")
+    else:
+        typer.echo(
+            f"Gateway restart failed: {result.message or result.state}",
+            err=True,
+        )
+        raise typer.Exit(code=result.exit_code_value)
 
 
 type _ChatCommandLaunchOverridesType = _ChatCommandLaunchOverrides

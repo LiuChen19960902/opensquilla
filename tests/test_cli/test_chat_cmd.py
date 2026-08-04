@@ -301,6 +301,7 @@ class TestChatCommand:
             workspace="",
             workspace_strict=None,
             timeout=None,
+            restart_gateway=False,
         )
 
     def test_chat_model_option_forwarded(self) -> None:
@@ -317,6 +318,7 @@ class TestChatCommand:
             workspace="",
             workspace_strict=None,
             timeout=None,
+            restart_gateway=False,
         )
 
     def test_chat_session_option_forwarded(self) -> None:
@@ -333,6 +335,7 @@ class TestChatCommand:
             workspace="",
             workspace_strict=None,
             timeout=None,
+            restart_gateway=False,
         )
 
     def test_chat_rejects_unknown_public_ui_mode_before_launch(self) -> None:
@@ -365,6 +368,7 @@ class TestChatCommand:
             workspace="",
             workspace_strict=None,
             timeout=12.5,
+            restart_gateway=False,
         )
 
     def test_chat_workspace_options_forwarded(self) -> None:
@@ -383,6 +387,7 @@ class TestChatCommand:
             workspace="repo",
             workspace_strict=True,
             timeout=None,
+            restart_gateway=False,
         )
 
     def test_chat_ui_option_forwarded(self) -> None:
@@ -398,6 +403,7 @@ class TestChatCommand:
             workspace="",
             workspace_strict=None,
             timeout=None,
+            restart_gateway=False,
         )
 
     def test_gateway_chat_workspace_options_warn_without_forwarding(

@@ -1000,3 +1000,28 @@ async def run_gateway_chat(
             with suppress(Exception):
                 await close_routing_subscription()
         await client.close()
+
+
+def restart_gateway_daemon() -> "GatewayLifecycleResult":
+    """Restart (or start) the gateway daemon before a gateway-backed chat.
+
+    Resolves the config path the same way ``default_gateway_url`` does, so a
+    profile-activated CLI (``OPENSQUILLA_PROFILE`` set) restarts the daemon
+    with the active profile's config instead of falling back to the default
+    ``~/.opensquilla`` home. Returns the lifecycle result so callers can
+    surface state (``running``/``start_failed``/...) to the user.
+    """
+    from opensquilla.cli.gateway_cmd import _lifecycle_manager
+    from opensquilla.cli.gateway_lifecycle import GatewayLifecycleResult
+    from opensquilla.onboarding.config_store import resolve_config_path
+
+    config_path: str | None = None
+    try:
+        implicit, _source = resolve_config_path(None)
+        if implicit.is_file():
+            config_path = str(implicit)
+    except Exception:  # noqa: BLE001 - fall back to default discovery
+        config_path = None
+
+    manager = _lifecycle_manager(port=None, bind=None, listen="", config_path=config_path)
+    return manager.restart()

@@ -1125,9 +1125,22 @@ def chat(
     timeout: float | None = typer.Option(
         None, "--timeout", "-T", help="Total agent timeout in seconds (0=unlimited)"
     ),
+    restart_gateway: bool = typer.Option(
+        False,
+        "--restart-gateway",
+        help="Restart (or start) the gateway daemon before connecting. "
+        "Use after config edits that only take effect on a full restart.",
+    ),
 ) -> None:
     """Start interactive chat mode."""
-    from opensquilla.cli.chat_cmd import run_chat
+    from opensquilla.cli.chat_cmd import _restart_gateway_before_chat, run_chat
+
+    if restart_gateway:
+        # CLI layer: restart_gateway is a real bool here (typer-parsed).
+        if standalone:
+            typer.echo("--restart-gateway ignored in --standalone mode.", err=True)
+        else:
+            _restart_gateway_before_chat()
 
     if standalone:
         from opensquilla.recovery import guarded_desktop_profile
@@ -1141,6 +1154,7 @@ def chat(
                 workspace=workspace,
                 workspace_strict=workspace_strict,
                 timeout=timeout,
+                restart_gateway=restart_gateway,
             )
         return
 
@@ -1154,6 +1168,7 @@ def chat(
         workspace=workspace,
         workspace_strict=workspace_strict,
         timeout=timeout,
+        restart_gateway=restart_gateway,
     )
 
 
