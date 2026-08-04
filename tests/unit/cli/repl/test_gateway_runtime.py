@@ -1164,6 +1164,95 @@ async def test_external_turn_discovery_routes_interleaved_turns_once(
 
 
 @pytest.mark.asyncio
+async def test_subagent_completion_event_renders_visible_notice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subagent completion event renders a notice without any model turn."""
+    from opensquilla.cli.gateway_client import GatewayClient
+    from opensquilla.cli.repl import gateway_runtime
+
+    session_key = "agent:main:shared"
+    client = GatewayClient()
+
+    async def call(method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        if method == "sessions.messages.subscribe":
+            return {"replay_complete": True, "current_stream_seq": 0}
+        if method == "sessions.bootstrap":
+            return {
+                "session": {"session_key": session_key, "model": "gateway/model"},
+                "history": {"messages": []},
+            }
+        return {}
+
+    monkeypatch.setattr(client, "_call", call)
+    discovery = await client.subscribe_session_events(session_key)
+    state = ChatSessionState(session_key=session_key, model="gateway/model")
+    context = gateway_runtime.GatewaySessionContext.create(state)
+
+    sent: list[tuple[str, dict[str, object]]] = []
+
+    class _Output:
+        async def send_message(self, kind: str, payload: dict[str, object]) -> None:
+            sent.append((kind, payload))
+
+    idle = asyncio.Event()
+    idle.set()
+    external_idle = asyncio.Event()
+    external_idle.set()
+    deps = gateway_runtime.GatewayRuntimeDependencies(
+        stream_response=cast(Any, None),
+        handle_slash_command=cast(Any, None),
+        run_input_loop=cast(Any, None),
+        get_tui_output=lambda _scope: cast(Any, _Output()),
+        is_exit_command=lambda _value: False,
+        notify=lambda _notice: None,
+    )
+    mirror = asyncio.create_task(
+        gateway_runtime._mirror_external_turns(
+            discovery,
+            client=client,
+            session_key=session_key,
+            session_context=context,
+            deps=deps,
+            elevated_state={"mode": None},
+            local_turn_idle=idle,
+            external_turn_idle=external_idle,
+        )
+    )
+
+    client._publish_event(  # noqa: SLF001
+        {
+            "type": "event",
+            "event": "session.event.subagent_completion",
+            "payload": {
+                "session_key": session_key,
+                "child_session_key": "agent:main:subagent:abc123",
+                "status": "succeeded",
+                "result": {"text": "EXACT_TEXT: DONE\n", "truncated": False},
+            },
+        }
+    )
+
+    for _ in range(100):
+        if sent:
+            break
+        await asyncio.sleep(0.02)
+
+    assert sent, "expected a notice.write message for the completion event"
+    kind, payload = sent[0]
+    assert kind == "notice.write"
+    text = str(payload["text"])
+    assert "agent:main:subagent:abc123" in text
+    assert "succeeded" in text
+    assert "DONE" in text
+
+    mirror.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await mirror
+    await discovery.close()
+
+
+@pytest.mark.asyncio
 async def test_external_turn_remaining_discovery_frames_do_not_duplicate_projection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

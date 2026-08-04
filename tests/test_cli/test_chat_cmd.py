@@ -15,6 +15,7 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from opensquilla.cli import chat_cmd
+from opensquilla.cli.chat import gateway_runtime
 from opensquilla.cli.chat.turn_stream import turn_stream_error_message
 from opensquilla.cli.main import app
 from opensquilla.cli.repl import commands as repl_commands
@@ -2232,3 +2233,58 @@ async def test_gateway_elevated_unknown_prefix_is_not_handled(monkeypatch) -> No
     )
 
     assert handled is False
+
+
+class TestWarnIfGatewayConfigDrift:
+    """Proactive reminder when the on-disk config is newer than the gateway."""
+
+    def _write_gateway_state(self, tmp_path, started_at: str, config_path) -> None:
+        state_dir = tmp_path / "state" / "gateway"
+        state_dir.mkdir(parents=True)
+        (state_dir / "gateway.json").write_text(
+            '{"pid": 123, "startedAt": "%s", "configPath": "%s"}' % (started_at, config_path),
+            encoding="utf-8",
+        )
+
+    def test_warns_when_config_newer_than_gateway(self, tmp_path, monkeypatch, capsys) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text("[task_runtime]\nmax_concurrency = 13\n", encoding="utf-8")
+        import os, time
+        os.utime(config, (time.time() - 60, time.time() - 60))  # config edited 60s ago
+        self._write_gateway_state(tmp_path, "2026-08-04T02:00:00Z", str(config))
+        monkeypatch.setattr("opensquilla.cli.chat.gateway_runtime.resolve_config_path", lambda *a: (config, "explicit"))
+        monkeypatch.setattr("opensquilla.cli.chat.gateway_runtime.default_opensquilla_home", lambda: tmp_path)
+
+        gateway_runtime.warn_if_gateway_config_drift()
+
+        err = capsys.readouterr().err
+        assert "配置已修改但 gateway 未重启" in err
+
+    def test_silent_when_config_older_than_gateway(self, tmp_path, monkeypatch, capsys) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text("[task_runtime]\nmax_concurrency = 13\n", encoding="utf-8")
+        import os, time
+        from datetime import datetime, timezone
+
+        os.utime(config, (time.time() - 3600, time.time() - 3600))  # config edited 1h ago
+        # gateway started *after* the config edit (30 min ago), so no drift.
+        started_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        self._write_gateway_state(tmp_path, started_at, str(config))
+        monkeypatch.setattr("opensquilla.cli.chat.gateway_runtime.resolve_config_path", lambda *a: (config, "explicit"))
+        monkeypatch.setattr("opensquilla.cli.chat.gateway_runtime.default_opensquilla_home", lambda: tmp_path)
+
+        gateway_runtime.warn_if_gateway_config_drift()
+
+        err = capsys.readouterr().err
+        assert err == ""
+
+    def test_silent_when_no_gateway_state(self, tmp_path, monkeypatch, capsys) -> None:
+        config = tmp_path / "config.toml"
+        config.write_text("[task_runtime]\n", encoding="utf-8")
+        monkeypatch.setattr("opensquilla.cli.chat.gateway_runtime.resolve_config_path", lambda *a: (config, "explicit"))
+        # default_opensquilla_home points at tmp_path but no state/gateway/gateway.json exists
+
+        gateway_runtime.warn_if_gateway_config_drift()
+
+        err = capsys.readouterr().err
+        assert err == ""

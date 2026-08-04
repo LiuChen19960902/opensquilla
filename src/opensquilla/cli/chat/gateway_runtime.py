@@ -16,10 +16,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
+import typer
+
 from opensquilla.cli.chat.output import ChatOutputHandle
 from opensquilla.cli.chat.session_context import GatewayRuntimeScope, GatewaySessionContext
 from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
+from opensquilla.onboarding.config_store import resolve_config_path
+from opensquilla.paths import default_opensquilla_home
 from opensquilla.cli.tui.opentui.context import (
     send_context_patch,
     send_context_update,
@@ -366,6 +370,44 @@ async def _wait_for_output(
         await asyncio.sleep(0.01)
 
 
+async def _render_subagent_completion_notice(
+    event: dict[str, Any],
+    *,
+    deps: GatewayRuntimeDependencies,
+    session_context: GatewaySessionContext,
+) -> None:
+    """Render a subagent completion as a user-visible TUI notice.
+
+    The gateway emits ``session.event.subagent_completion`` (payload from
+    ``subagent_announce.announce_subagent_completion``) for every finished
+    child. Consuming it here makes completion visible in the conversation
+    unconditionally, instead of relying on the parent model to synthesize
+    the async parent-wake message.
+    """
+    output = await _wait_for_output(deps, session_context.scope)
+    send = getattr(output, "send_message", None)
+    if not callable(send):
+        return
+    child_key = str(event.get("child_session_key") or event.get("session_key") or "?")
+    status = str(event.get("status") or "completed")
+    icon = {
+        "succeeded": "✓",
+        "failed": "✗",
+        "timeout": "⏱",
+        "cancelled": "⊘",
+        "abandoned": "·",
+    }.get(status, "·")
+    line = f"{icon} subagent {child_key} — {status}"
+    result = event.get("result")
+    text = result.get("text") if isinstance(result, dict) else None
+    if isinstance(text, str) and text.strip():
+        first_line = text.strip().splitlines()[0]
+        if len(first_line) > 140:
+            first_line = f"{first_line[:140]}…"
+        line = f"{line}: {first_line}"
+    await send("notice.write", {"text": line})
+
+
 async def _watch_approval_events(
     subscription: Any,
     *,
@@ -458,6 +500,21 @@ async def _mirror_external_turns(
                 event = _flatten_event_frame(frame)
                 event_name = str(event.get("event") or "")
                 if not event_name.startswith("session.event."):
+                    continue
+                # Subagent completions carry no turn identity, so the turn
+                # mirror below would silently drop them and the user would
+                # only learn about finished children if the model happened to
+                # synthesize the parent wake. Surface them as a visible notice
+                # unconditionally — no model behavior required.
+                if event_name == "session.event.subagent_completion":
+                    try:
+                        await _render_subagent_completion_notice(
+                            event,
+                            deps=deps,
+                            session_context=session_context,
+                        )
+                    except Exception:  # noqa: BLE001 - a notice must never break discovery
+                        pass
                     continue
                 turn_id, client_message_id, surface_id = _event_identity(event)
                 user_message_id = _event_user_message_id(event)
@@ -1025,3 +1082,60 @@ def restart_gateway_daemon() -> "GatewayLifecycleResult":
 
     manager = _lifecycle_manager(port=None, bind=None, listen="", config_path=config_path)
     return manager.restart()
+
+
+def restart_gateway_before_chat() -> None:
+    """Restart the gateway daemon (or start it if not running) before connecting."""
+    result = restart_gateway_daemon()
+    if result.ok:
+        detail = f" (pid={result.pid})" if result.pid else ""
+        typer.echo(f"Gateway {result.state}: {result.message}{detail}")
+    else:
+        typer.echo(
+            f"Gateway restart failed: {result.message or result.state}",
+            err=True,
+        )
+        raise typer.Exit(code=result.exit_code_value)
+
+
+def warn_if_gateway_config_drift() -> None:
+    """Proactively warn when the active config changed after the gateway started.
+
+    Boot-baked settings (``task_runtime.max_concurrency``,
+    ``subagents.subagent_reserved_slots``) are fixed into TaskRuntime when the
+    gateway daemon starts; ``config.reload`` hot-apply does not rebuild them.
+    If the on-disk config is newer than the running gateway, this session would
+    silently run the old settings — surface that before connecting so the user
+    can decide to restart. Best-effort: never raises, never blocks chat.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    try:
+        config_path: Path
+        config_path, _source = resolve_config_path(None)
+        if not config_path.is_file():
+            return
+        state_file = default_opensquilla_home() / "state" / "gateway" / "gateway.json"
+        if not state_file.is_file():
+            return
+        payload = _json.loads(state_file.read_text(encoding="utf-8"))
+        started_at = payload.get("startedAt")
+        if not started_at:
+            return
+        gateway_start = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+        config_mtime = datetime.fromtimestamp(config_path.stat().st_mtime, tz=timezone.utc)
+        if config_mtime <= gateway_start:
+            return
+        typer.echo(
+            typer.style(
+                "⚠️ 检测到配置已修改但 gateway 未重启：本次会话将运行旧配置"
+                "（如并发等启动时写死的参数不生效）。\n"
+                "  退出后运行 osq --restart-gateway 重启生效。",
+                fg=typer.colors.YELLOW,
+            ),
+            err=True,
+        )
+    except Exception:  # noqa: BLE001 - best-effort warning only
+        return

@@ -1133,14 +1133,18 @@ def chat(
     ),
 ) -> None:
     """Start interactive chat mode."""
-    from opensquilla.cli.chat_cmd import _restart_gateway_before_chat, run_chat
+    from opensquilla.cli.chat.gateway_runtime import (
+        restart_gateway_before_chat,
+        warn_if_gateway_config_drift,
+    )
+    from opensquilla.cli.chat_cmd import run_chat
 
     if restart_gateway:
         # CLI layer: restart_gateway is a real bool here (typer-parsed).
         if standalone:
             typer.echo("--restart-gateway ignored in --standalone mode.", err=True)
         else:
-            _restart_gateway_before_chat()
+            restart_gateway_before_chat()
 
     if standalone:
         from opensquilla.recovery import guarded_desktop_profile
@@ -1160,6 +1164,7 @@ def chat(
 
     # Gateway-backed chat is a client of the already-locked gateway; taking
     # the same lock here would reject the ordinary interactive client.
+    warn_if_gateway_config_drift()
     run_chat(
         model=model,
         session_id=session_id,

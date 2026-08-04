@@ -84,20 +84,4 @@ def run_chat(
     )
 
 
-def _restart_gateway_before_chat() -> None:
-    """Restart the gateway daemon (or start it if not running) before connecting."""
-    from opensquilla.cli.chat.gateway_runtime import restart_gateway_daemon
-
-    result = restart_gateway_daemon()
-    if result.ok:
-        detail = f" (pid={result.pid})" if result.pid else ""
-        typer.echo(f"Gateway {result.state}: {result.message}{detail}")
-    else:
-        typer.echo(
-            f"Gateway restart failed: {result.message or result.state}",
-            err=True,
-        )
-        raise typer.Exit(code=result.exit_code_value)
-
-
 type _ChatCommandLaunchOverridesType = _ChatCommandLaunchOverrides
