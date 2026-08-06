@@ -31,3 +31,29 @@ def run_mcp_server(
         raise typer.Exit(1) from exc
 
     mcp.run(transport="stdio")
+
+
+@app.command("chat")
+def run_chat_server(
+    gateway_url: str = typer.Option(
+        "ws://localhost:18791/ws",
+        "--gateway",
+        envvar="OPENSQUILLA_GATEWAY_URL",
+        help="OpenSquilla gateway URL to bridge to.",
+    ),
+) -> None:
+    """Run a stdio MCP server exposing one chat tool backed by the full agent."""
+
+    from opensquilla.mcp_server.chat_server import (
+        OpenSquillaChatBridge,
+        create_chat_server,
+    )
+
+    bridge = OpenSquillaChatBridge(gateway_url=normalize_gateway_url(gateway_url))
+    try:
+        mcp = create_chat_server(bridge)
+    except RuntimeError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+
+    mcp.run(transport="stdio")

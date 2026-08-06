@@ -79,6 +79,13 @@ class TuiPluginOutputHandle:
             return False
         return bool(await presenter(request))
 
+    async def present_teammate_message(self, from_name: str, text: str) -> bool:
+        presenter = getattr(self._output_handle, "present_teammate_message", None)
+        if not callable(presenter):
+            return False
+        await presenter(from_name, text)
+        return True
+
     async def resolve_gateway_approval(
         self,
         approval_id: str,

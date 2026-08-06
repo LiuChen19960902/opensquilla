@@ -681,6 +681,13 @@ class ServiceContainer:
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
     prompt_cache_keepalive_service: Any = None
+
+
+    teammate_runtime: Any = None
+    teammate_loop_task: asyncio.Task[Any] | None = field(default=None, repr=False)
+    # Deferred teammate→lead event emitter, filled by start_gateway_server once
+    # the EventBridge exists (the sink closure lives in build_services).
+    _teammate_event_emit: list[Callable[..., Any]] = field(default_factory=list)
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
     deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
@@ -846,6 +853,24 @@ class ServiceContainer:
                 set_task_runtime(None)
             except Exception:
                 pass
+
+        if self.teammate_loop_task is not None:
+            self.teammate_loop_task.cancel()
+            try:
+                await self.teammate_loop_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self.teammate_loop_task = None
+        if self.teammate_runtime is not None:
+            try:
+                from opensquilla.teammate.tools import set_teammate_manager
+
+                set_teammate_manager(None)
+            except Exception:
+                pass
+            self.teammate_runtime = None
 
         if self.usage_event_sink is not None:
             try:
@@ -1247,6 +1272,28 @@ def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
     if isinstance(principal_host_execute, bool):
         return principal_host_execute
     return _task_runtime_envelope_owner(envelope)
+
+
+def wire_teammate_llm_executor(svc: Any, task_runtime: Any) -> None:
+    """P1: swap the teammate executor from stub → real LLM executor.
+
+    Called right after ``TaskRuntime`` is built (start_gateway_server). Each
+    teammate wake-up then becomes a real agent turn in the member's own
+    session (independent context window / tools / agent). Falls back to the
+    stub silently when the runtime is unavailable (standalone CLI, tests).
+    """
+    try:
+        if svc.teammate_runtime is None or task_runtime is None:
+            return
+        from opensquilla.teammate.llm_executor import TeammateLLMExecutor
+
+        llm_executor = TeammateLLMExecutor(
+            task_runtime=task_runtime,
+            session_manager=svc.session_manager,
+        )
+        svc.teammate_runtime.executor = llm_executor
+    except Exception:
+        log.warning("gateway.teammate_llm_executor_swap_failed", exc_info=True)
 
 
 async def dispatch_task_runtime_turn(
@@ -2643,6 +2690,91 @@ async def build_services(
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
     session_storage = get_session_storage(session_manager)
+
+    # Wire the teammate subsystem into the tool layer (P1 gateway integration).
+    # The manager is durable (registry + mailboxes on disk under state_dir
+    # "teams"); the resident poll loop is started later in the start phase.
+    from opensquilla.engine.teammate import TeammateManager
+    from opensquilla.teammate.registry import TeamRegistry, default_teams_root
+    from opensquilla.teammate.runtime import StubTeammateExecutor, TeammateRuntime
+    from opensquilla.teammate.tools import set_teammate_manager as _set_teammate_manager
+
+    _teammate_registry = TeamRegistry(default_teams_root())
+    # P1: teammates run real agent turns in their own sessions via
+    # TaskRuntime.enqueue. task_runtime is built LATER in build_services
+    # (after turn_runner), so we start with the stub here and hot-swap to
+    # the LLM executor right after task_runtime exists (see below).
+    _teammate_executor = StubTeammateExecutor()
+    _teammate_manager = TeammateManager(_teammate_registry, executor=_teammate_executor)
+    try:
+        _teammate_manager.restore_teams()
+    except Exception:
+        log.debug("gateway.teammate_restore_failed", exc_info=True)
+    _set_teammate_manager(_teammate_manager)
+
+    # Deferred event emitter for teammate messages → the lead's TUI. Filled in
+    # once EventBridge exists later in build_services (same closure scope).
+    _teammate_event_emit: list[Callable[..., Awaitable[Any]]] = []
+
+    async def _teammate_visible_sink(
+        team_id: str, from_name: str, text: str, notify_only: bool = True
+    ) -> None:
+        """Stream a teammate reply onto the team lead's visible session.
+
+        ``notify_only`` replies are system-role notices: they render on the
+        lead's screen but are excluded from the lead's LLM context (the
+        context builder keeps only user/assistant roles), so the lead is not
+        woken and never auto-replies — Claude Code's idle_notification
+        semantics. Non-notify (P1 SendMessage semantics) go in as user role.
+        """
+        try:
+            team = _teammate_registry.get_team(team_id)
+            if team is None or not team.lead_session_key:
+                return
+            # role "teammate": rendered by the TUI as a real message (colored
+            # member name + white body, Claude Code shared transcript), but
+            # excluded from the lead's LLM context — the context builder keeps
+            # only user/assistant roles, so teammates never wake the lead or
+            # pollute its context. Escalations (notify_only=False) go in as
+            # user role so the lead is actually prompted to decide.
+            role = "teammate" if notify_only else "user"
+            body = f"{from_name}: {text}"
+            await session_manager.append_message(
+                team.lead_session_key,
+                role,
+                body,
+                provenance={
+                    "kind": "teammate_reply",
+                    "from": from_name,
+                    "notify_only": notify_only,
+                },
+            )
+            # Push a live event so the lead's TUI renders the message
+            # immediately (Claude Code shared-transcript behavior) instead of
+            # waiting for the next history refresh.
+            if _teammate_event_emit:
+                try:
+                    await _teammate_event_emit[0](
+                        team.lead_session_key,
+                        "session.event.teammate",
+                        {
+                            "session_key": team.lead_session_key,
+                            "from": from_name,
+                            "text": text,
+                            "notify_only": notify_only,
+                        },
+                    )
+                except Exception:
+                    log.debug("gateway.teammate_event_emit_failed", exc_info=True)
+        except Exception:
+            log.debug("gateway.teammate_visible_sink_failed", exc_info=True)
+
+    _teammate_runtime = TeammateRuntime(
+        _teammate_manager,
+        poll_interval=0.2,
+        executor=_teammate_executor,
+        visible_sink=_teammate_visible_sink,
+    )
     from opensquilla.application.approval_queue import get_approval_queue
 
     _expire_restart_orphaned_approvals(
@@ -3292,6 +3424,11 @@ async def build_services(
     )
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
+    svc.teammate_runtime = _teammate_runtime
+    # Hand the deferred teammate event emitter to start_gateway_server (it is
+    # filled once EventBridge exists there; the sink closure above reads the
+    # same list object).
+    svc._teammate_event_emit = _teammate_event_emit
     log.info(
         "build_services.ready",
         duration_ms=_elapsed_monotonic_ms(services_started_at),
@@ -3671,6 +3808,10 @@ async def start_gateway_server(
         subscription_manager=subscription_manager,
         connection_registry=get_registry(),
     )
+    # Fill the deferred teammate event emitter (visible_sink was defined in
+    # build_services before EventBridge existed; the list travels on svc).
+    if not svc._teammate_event_emit:
+        svc._teammate_event_emit.append(runtime_event_bridge.emit)
 
     from opensquilla.engine.cache_break_monitor import add_compaction_listener
 
@@ -3797,6 +3938,12 @@ async def start_gateway_server(
     else:
         log.warning("gateway.prompt_cache_keepalive_recorder_unavailable")
     svc.prompt_cache_keepalive_service = prompt_cache_keepalive_service
+
+
+    # P1: hot-swap the teammate executor from stub → real LLM now that the
+    # task runtime exists. Each teammate wake-up becomes a real agent turn in
+    # the member's own session (independent context window / tools / agent).
+    wire_teammate_llm_executor(svc, task_runtime)
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
     if callable(attach_runtime):
@@ -3844,6 +3991,15 @@ async def start_gateway_server(
 
     await heartbeat_loop.start()
     svc.heartbeat_loop = heartbeat_loop
+
+    # Start the teammate resident poll loop (gateway mode: all teams, stays
+    # alive until shutdown). Teammates created via teammate_create are then
+    # processed by the stub executor (P0) until the real LLM executor lands.
+    if getattr(svc, "teammate_runtime", None) is not None:
+        svc.teammate_loop_task = asyncio.create_task(
+            svc.teammate_runtime.run_all(),
+            name="teammate-resident-loop",
+        )
 
     # Register cron agent_run handler (DI-based, no monkey-patch)
     if svc.cron_scheduler is not None:

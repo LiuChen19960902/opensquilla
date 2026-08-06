@@ -27,6 +27,8 @@ from opensquilla.cli.tui.opentui.messages import (
     AttachmentRemove,
     AttachmentState,
     AttachmentUpdate,
+    BlockBegin,
+    BlockEnd,
     CompletionContext,
     ComposerState,
     ContextUpdate,
@@ -142,6 +144,25 @@ class OpenTuiOutputHandle:
 
     async def send_message(self, message_type: str, payload: dict[str, object]) -> None:
         await self._bridge.send(message_type, payload)
+
+    async def present_teammate_message(self, from_name: str, text: str) -> None:
+        """Render a teammate message immediately (live shared transcript).
+
+        Emits a ``teammate`` block (colored member name + white body) into the
+        transcript so the lead sees the team conversation in real time without
+        waiting for the next history reload.
+        """
+        block_id = f"teammate-{self._attachment_seq}"
+        self._attachment_seq += 1
+        await self._bridge.send(
+            "block.begin",
+            BlockBegin(
+                id=block_id,
+                kind="teammate",
+                meta={"text": f"{from_name}: {text}"},
+            ),
+        )
+        await self._bridge.send("block.end", BlockEnd(id=block_id))
 
     async def add_attachment(
         self,

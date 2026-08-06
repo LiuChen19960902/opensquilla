@@ -26,6 +26,7 @@ _NAMES = [
     "session_search",
     "shell",
     "submit_tool",
+    "teammate",
     "tool_results",
     "web",
     "web_fetch",

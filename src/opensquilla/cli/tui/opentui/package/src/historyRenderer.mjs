@@ -213,6 +213,18 @@ export function replayHistory({ messages, flow, nextId }) {
       continue;
     }
 
+    if (role === "teammate") {
+      // Inbound team-member message: rendered as a compact standalone row
+      // (colored member name + white body), outside the assistant turn cards.
+      if (legacyAdjacentTurnOpen && !causalTurnId) flow.endTurn(false);
+      const view = flow.turnForPrompt(id);
+      view.begin(`${blockPrefix}-teammate`, "teammate", {
+        text: safeText(raw.text) || "",
+      });
+      legacyAdjacentTurnOpen = true;
+      continue;
+    }
+
     const view = flow.ensure(id);
     const ensemble = ensembleReceipt(raw);
     if (ensemble) {

@@ -13,7 +13,7 @@ import { rendererViewportSnapshot } from "./screenMode.mjs";
 // style) instead of a stack of repeated cards. Unknown kinds default INTO the
 // card so a protocol addition can never seal it mid-turn; only the known
 // trailing kind (usage) closes it.
-const OUT_OF_CARD_KINDS = new Set(["prompt", "usage"]);
+const OUT_OF_CARD_KINDS = new Set(["prompt", "usage", "teammate"]);
 const DETAIL_KINDS = new Set(["thinking", "reasoning", "tool", "ensemble"]);
 
 export function isOutOfCardKind(kind) {

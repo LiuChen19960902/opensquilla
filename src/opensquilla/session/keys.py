@@ -147,6 +147,26 @@ def is_guest_webchat_key(session_key: str | None) -> bool:
     )
 
 
+def build_teammate_session_key(agent_id: str, team_id: str, name: str) -> str:
+    """Build the canonical agent-scoped teammate session key.
+
+    Shape: ``agent:<agent_id>:teammate:<team_id>:<name>`` — a teammate keeps
+    this session key across all its turns (that is what makes it *resident*).
+    """
+    aid = normalize_agent_id(agent_id)
+    tid = normalize_id_segment(team_id)
+    nm = normalize_id_segment(name)
+    return f"agent:{aid}:teammate:{tid}:{nm}"
+
+
+def is_teammate_key(session_key: str) -> bool:
+    """Return True for canonical teammate session keys."""
+    key = session_key.strip().lower()
+    return key.startswith("teammate:") or bool(
+        re.match(r"^agent:[^:]+:teammate:[^:]+:[^:]+$", key)
+    )
+
+
 def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
     """Return whether automatic private memory may be injected into a prompt."""
     key = canonicalize_session_key(session_key)

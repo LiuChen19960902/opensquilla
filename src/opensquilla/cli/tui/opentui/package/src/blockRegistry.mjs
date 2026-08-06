@@ -1,6 +1,7 @@
 import { THEME } from "./theme.mjs";
 import { TOOL_INDENT, stripTerminalControls } from "./primitives.mjs";
 import { createPromptBlock } from "./blocks/promptBlock.mjs";
+import { createTeammateBlock } from "./blocks/teammateBlock.mjs";
 import { createThinkingBlock } from "./blocks/thinkingBlock.mjs";
 import { createReasoningBlock } from "./blocks/reasoningBlock.mjs";
 import { createToolBlock } from "./blocks/toolBlock.mjs";
@@ -11,6 +12,9 @@ import { createErrorBlock } from "./blocks/errorBlock.mjs";
 
 const FACTORIES = {
   prompt: createPromptBlock,
+  // Inbound team-member message: colored member name + white body, rendered
+  // as a compact row outside the assistant turn cards.
+  teammate: createTeammateBlock,
   // Intermediate narration the model speaks between tool calls. It streams in
   // full, then long completed narration keeps a retained expandable preview.
   thinking: createThinkingBlock,

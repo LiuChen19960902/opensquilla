@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from contextlib import suppress
@@ -194,6 +195,20 @@ _APPROVAL_EVENTS = frozenset(
     }
 )
 _MODEL_ROUTING_EVENTS = frozenset({"models.routing.changed"})
+_TEAMMATE_EVENTS = frozenset({"session.event.teammate"})
+
+_SUBAGENT_NOTICE_ENV = "OPENSQUILLA_TUI_SUBAGENT_NOTICES"
+
+
+def _subagent_notices_enabled() -> bool:
+    """Whether subagent completion notices should be shown in the TUI.
+
+    Defaults to enabled. Set ``OPENSQUILLA_TUI_SUBAGENT_NOTICES=0`` (or
+    ``false``/``no``/``off``) in the environment to suppress the
+    ``✓ subagent ... — succeeded`` notices in the chat stream.
+    """
+    value = os.environ.get(_SUBAGENT_NOTICE_ENV, "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _flatten_event_frame(frame: dict[str, Any]) -> dict[str, Any]:
@@ -461,6 +476,43 @@ async def _watch_approval_events(
             cancel_pending()
 
 
+async def _watch_teammate_events(
+    subscription: Any,
+    *,
+    deps: GatewayRuntimeDependencies,
+    scope: GatewayRuntimeScope,
+) -> None:
+    """Render teammate messages onto the local TUI in real time.
+
+    The gateway emits ``session.event.teammate`` whenever a team member's
+    reply or lateral message is streamed to the lead session. This watcher
+    renders it immediately as a teammate block (colored member name + white
+    body), so the lead sees the team conversation live — Claude Code
+    shared-transcript behavior — without waiting for the next history reload.
+    """
+    output: ChatOutputHandle | None = None
+    try:
+        async for frame in subscription:
+            payload = frame.get("payload")
+            event = payload if isinstance(payload, dict) else {}
+            session_key = str(event.get("session_key") or "")
+            current_key = str(scope.get("session_key") or "")
+            if session_key and session_key != current_key:
+                continue
+            output = await _wait_for_output(deps, scope)
+            from_name = str(event.get("from") or "teammate")
+            text = str(event.get("text") or "")
+            if not text:
+                continue
+            present = getattr(output, "present_teammate_message", None)
+            if callable(present):
+                await present(from_name, text)
+    except asyncio.CancelledError:
+        raise
+    except (ConnectionError, StopAsyncIteration):
+        return
+
+
 async def _watch_model_routing_events(
     subscription: Any,
     *,
@@ -507,14 +559,15 @@ async def _mirror_external_turns(
                 # synthesize the parent wake. Surface them as a visible notice
                 # unconditionally — no model behavior required.
                 if event_name == "session.event.subagent_completion":
-                    try:
-                        await _render_subagent_completion_notice(
-                            event,
-                            deps=deps,
-                            session_context=session_context,
-                        )
-                    except Exception:  # noqa: BLE001 - a notice must never break discovery
-                        pass
+                    if _subagent_notices_enabled():
+                        try:
+                            await _render_subagent_completion_notice(
+                                event,
+                                deps=deps,
+                                session_context=session_context,
+                            )
+                        except Exception:  # noqa: BLE001 - a notice must never break discovery
+                            pass
                     continue
                 turn_id, client_message_id, surface_id = _event_identity(event)
                 user_message_id = _event_user_message_id(event)
@@ -818,6 +871,19 @@ async def run_gateway_chat(
                 routing_observer_task = asyncio.create_task(
                     _watch_model_routing_events(
                         routing_subscription,
+                        deps=deps,
+                        scope=session_context.scope,
+                    )
+                )
+            # Teammate messages stream to the lead's screen in real time.
+            try:
+                teammate_subscription = subscribe_global(_TEAMMATE_EVENTS)
+            except Exception:
+                teammate_subscription = None
+            if teammate_subscription is not None:
+                asyncio.create_task(
+                    _watch_teammate_events(
+                        teammate_subscription,
                         deps=deps,
                         scope=session_context.scope,
                     )
