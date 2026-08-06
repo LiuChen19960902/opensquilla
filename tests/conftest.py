@@ -22,6 +22,12 @@ os.environ.setdefault(
     "OPENSQUILLA_USER_STATE_DIR",
     str(_PYTEST_STATE_ROOT / "profile-lock-state"),
 )
+# Profile mode (paths.py) resolves config paths from OPENSQUILLA_PROFILE before
+# OPENSQUILLA_STATE_DIR. A caller that exported it (e.g. an agent shell inside
+# a profile-activated CLI) would make migration tests rewrite the real
+# profile's config.toml; strip it so every pytest run stays isolated from the
+# real home. Tests that need a profile set it themselves via monkeypatch.
+os.environ.pop("OPENSQUILLA_PROFILE", None)
 
 _PROVIDER_ENV_KEYS = (
     "AIHUBMIX_API_KEY",
