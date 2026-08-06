@@ -54,6 +54,35 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     assert catalog.resolve_context_window("deepseek-v4-flash", "deepseek") == 1_000_000
 
 
+def test_tokenrhythm_0731_uses_deepseek_dialect() -> None:
+    """deepseek-v4-flash-0731 (platform status=testing, live-verified to
+    accept DeepSeek thinking payloads including reasoning_effort=max) is the
+    one tokenrhythm row whose reasoning_format is the deepseek dialect — the
+    older V4 ids reject the thinking toggle with UNKNOWN_FIELD 400, so they
+    stay on "none"."""
+    catalog = ModelCatalog()
+
+    assert catalog.resolve_context_window(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == 1_000_000
+    assert catalog.resolve_max_tokens(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == 384_000
+    caps = catalog.get_capabilities(
+        "deepseek-v4-flash-0731", provider_name="tokenrhythm"
+    )
+    assert caps.supports_reasoning is True
+    assert caps.supports_tools is True
+    assert caps.reasoning_format == "deepseek"
+    # 旧 V4 模型保持 "none",不受 0731 的例外影响
+    assert (
+        catalog.get_capabilities(
+            "deepseek-v4-flash", provider_name="tokenrhythm"
+        ).reasoning_format
+        == "none"
+    )
+
+
 def test_direct_profile_windows_resolve_from_models_dev_snapshot() -> None:
     catalog = ModelCatalog()
 

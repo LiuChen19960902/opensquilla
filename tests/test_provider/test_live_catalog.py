@@ -183,6 +183,23 @@ def test_parse_tokenrhythm_models_skips_offline_and_malformed_rows() -> None:
     assert parse_tokenrhythm_models({}) == {}
 
 
+def test_parse_tokenrhythm_models_admits_testing_status() -> None:
+    # The platform publishes deepseek-v4-flash-0731 as status="testing" while
+    # it is fully callable (live-verified: chat completions and DeepSeek
+    # thinking payloads both accepted), so testing rows must reach the live
+    # layer; explicitly offline rows stay out.
+    payload = {
+        "code": 0,
+        "data": [
+            _tokenrhythm_row(),
+            _tokenrhythm_row(id="deepseek-v4-flash-0731", status="testing"),
+            _tokenrhythm_row(id="glm-5", status="offline"),
+        ],
+    }
+    entries = parse_tokenrhythm_models(payload)
+    assert set(entries) == {"deepseek-v4-pro", "deepseek-v4-flash-0731"}
+
+
 def test_parse_tokenrhythm_models_coerces_string_and_float_budget_fields() -> None:
     # The platform demonstrably serves numbers loosely (prices arrive as
     # strings); windows/outputs must survive the same shape drift instead

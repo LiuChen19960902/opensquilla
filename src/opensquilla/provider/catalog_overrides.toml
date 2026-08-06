@@ -686,6 +686,11 @@ reasoning_format = "qwen_token_plan"
 # parsing needs no format, and "none" keeps the request builder from
 # injecting a deepseek thinking object. Vision is published for the kimi
 # rows and qwen3.8-max; explicit API declarations remain authoritative.
+# injecting a deepseek thinking object. Vision is live-verified on the
+# kimi rows only. Exception: deepseek-v4-flash-0731 below is live-verified
+# to ACCEPT the DeepSeek thinking payload (thinking.enabled +
+# reasoning_effort, max included), so that row alone uses the deepseek
+# dialect.
 
 [tokenrhythm."deepseek-v4-flash"]
 context_window = 1000000
@@ -697,6 +702,22 @@ reasoning_format = "none"
 input_cost_per_mtok = 0.14336917562724014
 output_cost_per_mtok = 0.2867383512544803
 cache_read_cost_per_mtok = 0.02867383512544803
+
+# deepseek-v4-flash-0731 — DeepSeek 直连的 flash 测试版(平台 status=testing,
+# 已实测可调用且接受 thinking + reasoning_effort="max")。窗口/输出与
+# flash 相同,缓存读价更低(0.02 CNY)。与旧 V4 模型不同,它接收思考参数,
+# 所以 reasoning_format 用 "deepseek" 而非 "none";平台实测对该模型不返回
+# UNKNOWN_FIELD。
+[tokenrhythm."deepseek-v4-flash-0731"]
+context_window = 1000000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "deepseek"
+input_cost_per_mtok = 0.14336917562724014
+output_cost_per_mtok = 0.2867383512544803
+cache_read_cost_per_mtok = 0.002867383512544803
 
 [tokenrhythm."deepseek-v4-pro"]
 context_window = 1000000
