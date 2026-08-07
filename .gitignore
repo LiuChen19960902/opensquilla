@@ -127,3 +127,8 @@ opensquilla-webui/public/music/playlist.local.json
 
 # 本地 TUI 启动脚本（含本机路径，不入库）
 /tui.sh
+
+# Teammates 子系统工作区（每个队友一个目录：<name>-<team_id>/，含镜像副本、
+# node_modules 软链和运行时缓存，不入库）
+/agents/
+
