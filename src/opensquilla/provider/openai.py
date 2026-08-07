@@ -525,7 +525,7 @@ def _tokenrhythm_message_limit_evidence(
         return None
     rows = payload.get("data")
     if not isinstance(rows, list):
-        return None
+        rows = []
 
     limits: list[int] = []
     first_validation_message = ""
@@ -573,6 +573,209 @@ def _tokenrhythm_message_limit_evidence(
         base_host=_base_url_hostname(base_url),
     )
     return proof, first_validation_message
+
+
+_TOKENRHYTHM_REASONING_CONTENT_SOFT_LIMIT_DEFAULT = 16_000
+_TOKENRHYTHM_REASONING_CONTENT_SOFT_LIMIT_ENV = "OPENSQUILLA_TOKENRHYTHM_REASONING_SOFT_LIMIT"
+
+
+def _resolve_tokenrhythm_reasoning_soft_limit() -> int:
+    """Resolve proactive soft limit for TokenRhythm reasoning_content."""
+
+    raw = os.environ.get(_TOKENRHYTHM_REASONING_CONTENT_SOFT_LIMIT_ENV, "").strip()
+    if not raw:
+        return _TOKENRHYTHM_REASONING_CONTENT_SOFT_LIMIT_DEFAULT
+    lowered = raw.lower()
+    if lowered in {"0", "off", "disable", "disabled", "none"}:
+        return 0
+    try:
+        value = int(raw)
+    except ValueError:
+        return _TOKENRHYTHM_REASONING_CONTENT_SOFT_LIMIT_DEFAULT
+    if value <= 0:
+        return 0
+    return max(1_000, min(value, 64_000))
+
+
+def _truncate_reasoning_content_for_limit(value: str, limit: int) -> str:
+    """Truncate a single reasoning_content string to ``limit`` with head/tail preservation."""
+
+    if not isinstance(value, str) or len(value) <= limit:
+        return value
+    if limit <= 200:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        return f"[opensquilla_compacted:reasoning_content:{len(value)}:{digest}]"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    marker = (
+        f"\n\n[provider_request_reasoning_content_truncated: omitted "
+        f"{len(value)}->{limit} chars; original_chars={len(value)}; sha256={digest}]\n\n"
+    )
+    budget = limit - len(marker)
+    if budget <= 0:
+        short_digest = digest[:16]
+        return f"[opensquilla_compacted:reasoning_content:{len(value)}:{short_digest}]"
+    head_len = (budget * 3) // 5
+    tail_len = budget - head_len
+    truncated = f"{value[:head_len]}{marker}{value[-tail_len:] if tail_len > 0 else ''}"
+    if len(truncated) > limit:
+        truncated = truncated[:limit]
+    if len(truncated) >= len(value):
+        return value
+    return truncated
+
+
+def _apply_tokenrhythm_reasoning_soft_limit_to_payload(
+    payload: dict[str, Any],
+    limit: int,
+) -> bool:
+    """Apply soft limit to every reasoning_content in payload. Returns whether any was truncated."""
+
+    if limit <= 0:
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        reasoning = message.get("reasoning_content")
+        if not isinstance(reasoning, str) or len(reasoning) <= limit:
+            continue
+        truncated = _truncate_reasoning_content_for_limit(reasoning, limit)
+        if truncated != reasoning:
+            message["reasoning_content"] = truncated
+            changed = True
+            log.info(
+                "provider.tokenrhythm_reasoning_content_soft_truncated",
+                provider="tokenrhythm",
+                limit=limit,
+                original_chars=len(reasoning),
+                truncated_chars=len(truncated),
+            )
+    return changed
+
+
+def _tokenrhythm_reasoning_content_limit_evidence(
+    *,
+    provider_kind: str,
+    base_url: str,
+    status_code: int,
+    body: bytes | str,
+    wire_messages: object,
+) -> tuple[int, str] | None:
+    """Parse TokenRhythm's exact ``messages[].reasoning_content`` string length rejection.
+
+    Returns the strictest ``maximum`` and the first validation message when the
+    envelope, field path, numeric constraint and locally observed reasoning
+    lengths all agree.
+    """
+
+    if (
+        provider_kind != "tokenrhythm"
+        or status_code != 400
+        or not is_provider_app_host(base_url, "tokenrhythm.studio")
+        or not isinstance(wire_messages, list)
+    ):
+        return None
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("code") != "BAD_REQUEST":
+        return None
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        rows = []
+
+    limits: list[int] = []
+    first_validation_message = ""
+    observed_max_reasoning = 0
+    for message in wire_messages:
+        if isinstance(message, dict):
+            rc = message.get("reasoning_content")
+            if isinstance(rc, str):
+                observed_max_reasoning = max(observed_max_reasoning, len(rc))
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        maximum = row.get("maximum")
+        inclusive = row.get("inclusive")
+        path = row.get("path")
+        if (
+            row.get("origin") != "string"
+            or row.get("code") != "too_big"
+            or not isinstance(maximum, int)
+            or isinstance(maximum, bool)
+            or maximum <= 0
+            or not isinstance(inclusive, bool)
+            or not isinstance(path, list)
+            or len(path) != 3
+            or path[0] != "messages"
+            or not isinstance(path[1], int)
+            or isinstance(path[1], bool)
+            or path[2] != "reasoning_content"
+        ):
+            continue
+        if not 0 <= path[1] < len(wire_messages):
+            continue
+        limit = maximum if inclusive else maximum - 1
+        if limit <= 0:
+            continue
+        if observed_max_reasoning <= limit:
+            indexed = wire_messages[path[1]]
+            if not isinstance(indexed, dict):
+                continue
+            rc = indexed.get("reasoning_content")
+            if not isinstance(rc, str) or len(rc) <= limit:
+                continue
+        limits.append(limit)
+        if not first_validation_message:
+            first_validation_message = _safe_validation_message(row.get("message"))
+
+    if not limits:
+        # Textual fallback: some TokenRhythm deployments return only a
+        # localized message like ``messages.2.reasoning_content 长度超过允许上限``
+        # without a structured ``data`` array. Treat any 400 that mentions
+        # reasoning_content length as actionable and retry with a conservative
+        # truncation so the next request is strictly smaller.
+        payload_msg = ""
+        if isinstance(payload, dict):
+            raw_msg = payload.get("message")
+            if isinstance(raw_msg, str):
+                payload_msg = raw_msg
+        combined_text = (payload_msg + " " + text) if payload_msg else text
+        if "reasoning_content" in combined_text and any(
+            kw in combined_text for kw in ("too_big", "Too big", "长度超过", "允许上限", "at most", "maximum", "Maximum")
+        ):
+            # Observed max is the longest reasoning in the wire payload.
+            if observed_max_reasoning > 0:
+                # Prefer the exact structured maximum when available; otherwise
+                # fall back to a strictly smaller conservative limit so the
+                # retry makes progress. Use the soft limit as an upper bound
+                # but ensure we actually shrink the offending field.
+                soft = _resolve_tokenrhythm_reasoning_soft_limit()
+                # If soft is disabled, use 8000 as fallback.
+                if soft <= 0:
+                    soft = 8000
+                # Shrink to 75% of observed or soft-1000, whichever is smaller,
+                # but at least 1000 to keep head/tail.
+                candidate = min(
+                    int(observed_max_reasoning * 0.75),
+                    soft - 1000 if soft > 1000 else 8000,
+                    8000,
+                )
+                # Ensure candidate is smaller than observed and positive.
+                if candidate < observed_max_reasoning and candidate >= 1000:
+                    return candidate, _safe_validation_message(payload_msg or combined_text)
+                # As a last resort, truncate to 8000 if observed is huge.
+                if observed_max_reasoning > 8000:
+                    return 8000, _safe_validation_message(payload_msg or combined_text)
+        return None
+    limit = min(limits)
+    return limit, first_validation_message
 
 
 def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
@@ -3158,6 +3361,16 @@ class OpenAIProvider:
             cfg=cfg,
             has_tools=bool(tools),
         )
+        # Proactive TokenRhythm reasoning_content governance: bound every
+        # historical assistant reasoning string before budget proof and
+        # transport, so a single very long thinking turn does not poison the
+        # next request's single-field length validation. Reactive 400
+        # handling below still covers an exact upstream maximum that is
+        # stricter than this soft limit.
+        if self._provider_kind == "tokenrhythm":
+            soft_limit = _resolve_tokenrhythm_reasoning_soft_limit()
+            if soft_limit > 0:
+                _apply_tokenrhythm_reasoning_soft_limit_to_payload(payload, soft_limit)
         fallback_reason = (
             "native_is_error_unavailable"
             if any(message.get("role") == "tool" for message in openai_messages)
@@ -3500,107 +3713,201 @@ class OpenAIProvider:
             released.extend(deferred_post_native_events.drain())
             return released
 
-        try:
-            async with httpx.AsyncClient(
-                timeout=(
-                    _stream_timeout(cfg.timeout)
-                    if (
-                        self._compat.stream_timeout_fallback
-                        and cfg.physical_attempt_limit != 1
-                    )
-                    else cfg.timeout
-                ),
-                trust_env=_trust_env(),
-                proxy=self._proxy,
-                follow_redirects=False,
-            ) as client:
-                headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
-                headers.update(
-                    tokenrhythm_install_id_headers(
-                        self._provider_kind,
-                        self._base_url,
-                        proxy=self._proxy,
-                    )
-                )
-                async with client.stream(
-                    "POST",
-                    endpoint,
+        # TokenRhythm reasoning_content retry loop: a 400 with
+        # ``messages[].reasoning_content too_big`` is retried once after
+        # truncating every reasoning_content to the upstream maximum. The
+        # proactive soft limit in _build_payload already prevents most cases;
+        # this covers a stricter upstream limit observed in the wild.
+        _tokenrhythm_reasoning_retry_attempts = 0
+        while True:
+            if _tokenrhythm_reasoning_retry_attempts > 0:
+                cache_shape = _payload_cache_shape(payload, tools=tools)
+                trace.record_request(
+                    payload=payload,
                     headers=headers,
-                    json=payload,
-                ) as response:
-                    if self._compat.attribution_response_headers:
-                        attribution = {
-                            name: response.headers[name]
-                            for name in self._compat.attribution_response_headers
-                            if name in response.headers
-                        }
-                        if attribution:
-                            fallbacks_taken = _coerce_int(
-                                attribution.get("x-litellm-attempted-fallbacks")
+                    metadata={
+                        "cache_shape": cache_shape,
+                        "timeout_seconds": cfg.timeout,
+                        "tools_count": len(tools or []),
+                        "request_proof": budget_decision.proof,
+                        "retry_reason": "tokenrhythm_reasoning_content_limit",
+                        "retry_attempt": _tokenrhythm_reasoning_retry_attempts,
+                    },
+                )
+            try:
+                async with httpx.AsyncClient(
+                    timeout=(
+                        _stream_timeout(cfg.timeout)
+                        if (
+                            self._compat.stream_timeout_fallback
+                            and cfg.physical_attempt_limit != 1
+                        )
+                        else cfg.timeout
+                    ),
+                    trust_env=_trust_env(),
+                    proxy=self._proxy,
+                    follow_redirects=False,
+                ) as client:
+                    headers.pop(TOKENRHYTHM_INSTALL_ID_HEADER, None)
+                    headers.update(
+                        tokenrhythm_install_id_headers(
+                            self._provider_kind,
+                            self._base_url,
+                            proxy=self._proxy,
+                        )
+                    )
+                    async with client.stream(
+                        "POST",
+                        endpoint,
+                        headers=headers,
+                        json=payload,
+                    ) as response:
+                        if self._compat.attribution_response_headers:
+                            attribution = {
+                                name: response.headers[name]
+                                for name in self._compat.attribution_response_headers
+                                if name in response.headers
+                            }
+                            if attribution:
+                                fallbacks_taken = _coerce_int(
+                                    attribution.get("x-litellm-attempted-fallbacks")
+                                )
+                                log_fn = log.warning if fallbacks_taken > 0 else log.info
+                                log_fn(
+                                    "provider.gateway_attribution",
+                                    provider=self._provider_kind,
+                                    requested_model=self._model,
+                                    **{k.replace("-", "_"): v for k, v in attribution.items()},
+                                )
+                        if response.status_code != 200:
+                            body = await response.aread()
+                            body_text = (
+                                body.decode("utf-8", errors="replace")
+                                if isinstance(body, bytes)
+                                else str(body)
                             )
-                            log_fn = log.warning if fallbacks_taken > 0 else log.info
-                            log_fn(
-                                "provider.gateway_attribution",
-                                provider=self._provider_kind,
-                                requested_model=self._model,
-                                **{k.replace("-", "_"): v for k, v in attribution.items()},
-                            )
-                    if response.status_code != 200:
-                        body = await response.aread()
-                        body_text = (
-                            body.decode("utf-8", errors="replace")
-                            if isinstance(body, bytes)
-                            else str(body)
-                        )
-                        safe_body_text = redact_upstream_error_text(
-                            body_text,
-                            api_key=self._api_key,
-                            max_len=4000,
-                        )
-                        message = redact_upstream_error_text(
-                            _format_chat_http_error(
-                                self._compat.display_name,
-                                response.status_code,
-                                body,
-                            ),
-                            api_key=self._api_key,
-                            max_len=2000,
-                        )
-                        message_limit_evidence = _tokenrhythm_message_limit_evidence(
-                            provider_kind=self._provider_kind,
-                            base_url=self._base_url,
-                            model=self._model,
-                            status_code=response.status_code,
-                            body=body,
-                            wire_messages=payload.get("messages"),
-                            logical_messages=len(messages),
-                        )
-                        if message_limit_evidence is not None:
-                            message_limit_proof, validation_message = message_limit_evidence
-                            message = _format_tokenrhythm_message_limit_error(
-                                self._compat.display_name,
-                                response.status_code,
-                                body,
-                                validation_message,
+                            safe_body_text = redact_upstream_error_text(
+                                body_text,
+                                api_key=self._api_key,
+                                max_len=4000,
                             )
                             message = redact_upstream_error_text(
-                                message,
+                                _format_chat_http_error(
+                                    self._compat.display_name,
+                                    response.status_code,
+                                    body,
+                                ),
                                 api_key=self._api_key,
                                 max_len=2000,
                             )
-                            proof_fields = asdict(message_limit_proof)
+                            reasoning_limit_evidence = _tokenrhythm_reasoning_content_limit_evidence(
+                                provider_kind=self._provider_kind,
+                                base_url=self._base_url,
+                                status_code=response.status_code,
+                                body=body,
+                                wire_messages=payload.get("messages"),
+                            )
+                            if (
+                                reasoning_limit_evidence is not None
+                                and _tokenrhythm_reasoning_retry_attempts == 0
+                            ):
+                                limit, validation_message = reasoning_limit_evidence
+                                changed = _apply_tokenrhythm_reasoning_soft_limit_to_payload(
+                                    payload, limit
+                                )
+                                if changed:
+                                    log.warning(
+                                        "provider.tokenrhythm_reasoning_content_limit_retry",
+                                        provider=self._provider_kind,
+                                        model=self._model,
+                                        limit=limit,
+                                        validation_message=validation_message,
+                                        retry_attempt=_tokenrhythm_reasoning_retry_attempts + 1,
+                                    )
+                                    trace.record_error(
+                                        code=str(response.status_code),
+                                        message="TokenRhythm reasoning_content limit detected, retrying truncated",
+                                        status_code=response.status_code,
+                                        metadata={
+                                            "cache_shape": cache_shape,
+                                            "reasoning_content_limit": limit,
+                                            "validation_message": validation_message,
+                                        },
+                                    )
+                                    _tokenrhythm_reasoning_retry_attempts += 1
+                                    continue
+
+                            message_limit_evidence = _tokenrhythm_message_limit_evidence(
+                                provider_kind=self._provider_kind,
+                                base_url=self._base_url,
+                                model=self._model,
+                                status_code=response.status_code,
+                                body=body,
+                                wire_messages=payload.get("messages"),
+                                logical_messages=len(messages),
+                            )
+                            if message_limit_evidence is not None:
+                                message_limit_proof, validation_message = message_limit_evidence
+                                message = _format_tokenrhythm_message_limit_error(
+                                    self._compat.display_name,
+                                    response.status_code,
+                                    body,
+                                    validation_message,
+                                )
+                                message = redact_upstream_error_text(
+                                    message,
+                                    api_key=self._api_key,
+                                    max_len=2000,
+                                )
+                                proof_fields = asdict(message_limit_proof)
+                                log.warning(
+                                    "provider.request_message_limit_detected",
+                                    **proof_fields,
+                                )
+                                trace.record_error(
+                                    code=str(response.status_code),
+                                    message="Provider request message limit detected",
+                                    status_code=response.status_code,
+                                    metadata={
+                                        "cache_shape": cache_shape,
+                                        "message_limit_proof": proof_fields,
+                                    },
+                                )
+                                yield ErrorEvent(
+                                    message=message,
+                                    code=str(response.status_code),
+                                    retry_after_s=retry_after_from_headers(
+                                        response.status_code,
+                                        getattr(response, "headers", None),
+                                    ),
+                                    message_limit_proof=message_limit_proof,
+                                )
+                                return
+                            # Diagnostic: dump payload head (no auth headers)
+                            # so 400s from picky upstreams are debuggable. Truncated
+                            # to keep memory low.
+                            try:
+                                _payload_head = json.dumps(
+                                    payload,
+                                    ensure_ascii=False,
+                                )[:4000]
+                            except Exception:  # noqa: BLE001
+                                _payload_head = repr(payload)[:4000]
                             log.warning(
-                                "provider.request_message_limit_detected",
-                                **proof_fields,
+                                "provider.chat_http_error",
+                                provider=self._provider_kind,
+                                model=self._model,
+                                status_code=response.status_code,
+                                message=message,
+                                response_body=safe_body_text[:2000],
+                                request_payload_head=_payload_head,
                             )
                             trace.record_error(
                                 code=str(response.status_code),
-                                message="Provider request message limit detected",
+                                message=message,
                                 status_code=response.status_code,
-                                metadata={
-                                    "cache_shape": cache_shape,
-                                    "message_limit_proof": proof_fields,
-                                },
+                                response_body=safe_body_text,
+                                metadata={"cache_shape": cache_shape},
                             )
                             yield ErrorEvent(
                                 message=message,
@@ -3609,191 +3916,210 @@ class OpenAIProvider:
                                     response.status_code,
                                     getattr(response, "headers", None),
                                 ),
-                                message_limit_proof=message_limit_proof,
                             )
                             return
-                        # Diagnostic: dump payload head (no auth headers)
-                        # so 400s from picky upstreams are debuggable. Truncated
-                        # to keep memory low.
-                        try:
-                            _payload_head = json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                            )[:4000]
-                        except Exception:  # noqa: BLE001
-                            _payload_head = repr(payload)[:4000]
-                        log.warning(
-                            "provider.chat_http_error",
-                            provider=self._provider_kind,
-                            model=self._model,
-                            status_code=response.status_code,
-                            message=message,
-                            response_body=safe_body_text[:2000],
-                            request_payload_head=_payload_head,
-                        )
-                        trace.record_error(
-                            code=str(response.status_code),
-                            message=message,
-                            status_code=response.status_code,
-                            response_body=safe_body_text,
-                            metadata={"cache_shape": cache_shape},
-                        )
-                        yield ErrorEvent(
-                            message=message,
-                            code=str(response.status_code),
-                            retry_after_s=retry_after_from_headers(
-                                response.status_code,
-                                getattr(response, "headers", None),
-                            ),
-                        )
-                        return
 
-                    response_ids: set[str] = set()
-                    trace_tool_calls: list[dict[str, Any]] = []
-                    async for line in response.aiter_lines():
-                        if not line.startswith("data:"):
-                            continue
-                        data_str = line[5:]
-                        if data_str.startswith(" "):
-                            data_str = data_str[1:]
-                        if data_str == "[DONE]":
-                            saw_done_sentinel = True
-                            break
-                        try:
-                            chunk = json.loads(data_str)
-                        except (json.JSONDecodeError, RecursionError):
-                            if data_str.strip():
+                        response_ids: set[str] = set()
+                        trace_tool_calls: list[dict[str, Any]] = []
+                        async for line in response.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data_str = line[5:]
+                            if data_str.startswith(" "):
+                                data_str = data_str[1:]
+                            if data_str == "[DONE]":
+                                saw_done_sentinel = True
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                            except (json.JSONDecodeError, RecursionError):
+                                if data_str.strip():
+                                    malformed_stream_frames += 1
+                                    log.warning(
+                                        "provider.invalid_stream_frame",
+                                        provider=self._provider_kind,
+                                        model=self._model,
+                                        frame_chars=len(data_str),
+                                    )
+                                continue
+                            if not isinstance(chunk, dict):
                                 malformed_stream_frames += 1
                                 log.warning(
                                     "provider.invalid_stream_frame",
                                     provider=self._provider_kind,
                                     model=self._model,
                                     frame_chars=len(data_str),
+                                    reason="json_frame_not_object",
                                 )
-                            continue
-                        if not isinstance(chunk, dict):
-                            malformed_stream_frames += 1
-                            log.warning(
-                                "provider.invalid_stream_frame",
-                                provider=self._provider_kind,
-                                model=self._model,
-                                frame_chars=len(data_str),
-                                reason="json_frame_not_object",
+                                continue
+                            billing_chunk = _exact_provider_billing_payload(
+                                self._provider_kind,
+                                chunk,
+                                data_str,
                             )
-                            continue
-                        billing_chunk = _exact_provider_billing_payload(
-                            self._provider_kind,
-                            chunk,
-                            data_str,
-                        )
 
-                        if "error" in chunk and chunk["error"] is not None:
-                            error_obj = chunk["error"]
-                            err_message = (
-                                str(error_obj.get("message") or "stream error frame")
-                                if isinstance(error_obj, Mapping)
-                                else str(error_obj).strip() or "stream error frame"
-                            )
-                            err_message = redact_upstream_error_text(
-                                err_message,
-                                api_key=self._api_key,
-                                max_len=2000,
-                            )
-                            raw_code = (
-                                error_obj.get("code")
-                                if isinstance(error_obj, Mapping)
-                                else None
-                            )
-                            err_code = (
-                                str(raw_code)
-                                if raw_code not in (None, "")
-                                else "stream_error"
-                            )
-                            err_code = redact_upstream_error_code(
-                                err_code,
-                                api_key=self._api_key,
-                            )
-                            log.warning(
-                                "provider.stream_error_frame",
-                                provider=self._provider_kind,
-                                model=self._model,
-                                code=err_code,
-                                message=err_message,
-                            )
-                            trace.record_error(
-                                code=err_code,
-                                message=err_message,
-                                metadata={
-                                    "phase": "stream",
-                                    "cache_shape": cache_shape,
-                                },
-                            )
-                            # An explicit top-level error field poisons the response,
-                            # including malformed empty error envelopes.
-                            # Provisional text/tool events already delivered stay
-                            # diagnostic only; no deferred End or Done is released.
-                            yield ErrorEvent(
-                                message=(
-                                    f"{self._compat.display_name} stream error: "
-                                    f"{err_message}"
-                                ),
-                                code=err_code,
-                            )
-                            return
-                        trace.record_chunk(chunk)
-                        chunk_id = chunk.get("id")
-                        if isinstance(chunk_id, str) and chunk_id:
-                            response_ids.add(chunk_id)
-                        chunk_model = chunk.get("model")
-                        if chunk_model:
-                            actual_model = chunk_model
-
-                        raw_choices = chunk.get("choices", [])
-                        if not isinstance(raw_choices, list) or len(raw_choices) > 1:
-                            trace.record_error(
-                                code="invalid_stream_frame",
-                                message="Provider stream returned an invalid choice batch",
-                                metadata={"phase": "stream", "cache_shape": cache_shape},
-                            )
-                            yield ErrorEvent(
-                                message=(
-                                    f"{self._compat.display_name} stream returned "
-                                    "multiple or malformed choices"
-                                ),
-                                code="invalid_stream_frame",
-                            )
-                            return
-                        if choice_terminal_seen:
-                            assert terminal_finish_reason is not None
-                            if not _is_inert_post_terminal_stream_frame(
-                                chunk=chunk,
-                                raw_choices=raw_choices,
-                                terminal_finish_reason=terminal_finish_reason,
-                                terminal_native_finish_reason_present=(
-                                    terminal_native_finish_reason_present
-                                ),
-                                terminal_native_finish_reason=(
-                                    terminal_native_finish_reason
-                                ),
-                                policy=self._compat,
-                            ):
+                            if "error" in chunk and chunk["error"] is not None:
+                                error_obj = chunk["error"]
+                                err_message = (
+                                    str(error_obj.get("message") or "stream error frame")
+                                    if isinstance(error_obj, Mapping)
+                                    else str(error_obj).strip() or "stream error frame"
+                                )
+                                err_message = redact_upstream_error_text(
+                                    err_message,
+                                    api_key=self._api_key,
+                                    max_len=2000,
+                                )
+                                raw_code = (
+                                    error_obj.get("code")
+                                    if isinstance(error_obj, Mapping)
+                                    else None
+                                )
+                                err_code = (
+                                    str(raw_code)
+                                    if raw_code not in (None, "")
+                                    else "stream_error"
+                                )
+                                err_code = redact_upstream_error_code(
+                                    err_code,
+                                    api_key=self._api_key,
+                                )
+                                log.warning(
+                                    "provider.stream_error_frame",
+                                    provider=self._provider_kind,
+                                    model=self._model,
+                                    code=err_code,
+                                    message=err_message,
+                                )
                                 trace.record_error(
-                                    code="invalid_stream_order",
-                                    message="Provider mutated state after finish_reason",
+                                    code=err_code,
+                                    message=err_message,
                                     metadata={
                                         "phase": "stream",
                                         "cache_shape": cache_shape,
                                     },
                                 )
+                                # An explicit top-level error field poisons the response,
+                                # including malformed empty error envelopes.
+                                # Provisional text/tool events already delivered stay
+                                # diagnostic only; no deferred End or Done is released.
                                 yield ErrorEvent(
                                     message=(
-                                        f"{self._compat.display_name} stream mutated "
-                                        "state after finish_reason"
+                                        f"{self._compat.display_name} stream error: "
+                                        f"{err_message}"
                                     ),
-                                    code="invalid_stream_order",
+                                    code=err_code,
                                 )
                                 return
+                            trace.record_chunk(chunk)
+                            chunk_id = chunk.get("id")
+                            if isinstance(chunk_id, str) and chunk_id:
+                                response_ids.add(chunk_id)
+                            chunk_model = chunk.get("model")
+                            if chunk_model:
+                                actual_model = chunk_model
+
+                            raw_choices = chunk.get("choices", [])
+                            if not isinstance(raw_choices, list) or len(raw_choices) > 1:
+                                trace.record_error(
+                                    code="invalid_stream_frame",
+                                    message="Provider stream returned an invalid choice batch",
+                                    metadata={"phase": "stream", "cache_shape": cache_shape},
+                                )
+                                yield ErrorEvent(
+                                    message=(
+                                        f"{self._compat.display_name} stream returned "
+                                        "multiple or malformed choices"
+                                    ),
+                                    code="invalid_stream_frame",
+                                )
+                                return
+                            if choice_terminal_seen:
+                                assert terminal_finish_reason is not None
+                                if not _is_inert_post_terminal_stream_frame(
+                                    chunk=chunk,
+                                    raw_choices=raw_choices,
+                                    terminal_finish_reason=terminal_finish_reason,
+                                    terminal_native_finish_reason_present=(
+                                        terminal_native_finish_reason_present
+                                    ),
+                                    terminal_native_finish_reason=(
+                                        terminal_native_finish_reason
+                                    ),
+                                    policy=self._compat,
+                                ):
+                                    trace.record_error(
+                                        code="invalid_stream_order",
+                                        message="Provider mutated state after finish_reason",
+                                        metadata={
+                                            "phase": "stream",
+                                            "cache_shape": cache_shape,
+                                        },
+                                    )
+                                    yield ErrorEvent(
+                                        message=(
+                                            f"{self._compat.display_name} stream mutated "
+                                            "state after finish_reason"
+                                        ),
+                                        code="invalid_stream_order",
+                                    )
+                                    return
+                                usage_payload = chunk.get("usage")
+                                billing_accumulator.update(
+                                    self._provider_kind,
+                                    billing_chunk,
+                                )
+                                if isinstance(usage_payload, Mapping):
+                                    usage_accumulator.update(usage_payload)
+                                    (
+                                        input_tokens,
+                                        output_tokens,
+                                        reasoning_tokens,
+                                        cached_tokens,
+                                        cache_write_tokens,
+                                        _,
+                                    ) = usage_accumulator.fields()
+                                    _log_provider_cache_usage(
+                                        provider_kind=self._provider_kind,
+                                        model=self._model,
+                                        actual_model=actual_model,
+                                        input_tokens=input_tokens,
+                                        cached_tokens=cached_tokens,
+                                        cache_write_tokens=cache_write_tokens,
+                                        cache_shape=cache_shape,
+                                    )
+                                # Usage was already accounted for above.  Do not let
+                                # the duplicate choice re-enter the normal parser or
+                                # append a second finish reason.
+                                continue
+
+                            # Usage is a cumulative snapshot. Apply it only after
+                            # the frame's outer shape has passed validation; later
+                            # snapshots replace fields they contain and preserve
+                            # details they omit.
                             usage_payload = chunk.get("usage")
+                            if usage_payload is not None and not isinstance(
+                                usage_payload,
+                                Mapping,
+                            ):
+                                trace.record_error(
+                                    code="invalid_stream_frame",
+                                    message="Provider stream returned malformed usage",
+                                    metadata={"phase": "stream", "cache_shape": cache_shape},
+                                )
+                                yield ErrorEvent(
+                                    message=(
+                                        f"{self._compat.display_name} stream returned "
+                                        "malformed usage"
+                                    ),
+                                    code="invalid_stream_frame",
+                                )
+                                return
+                            # Native billing fields are independent top-level
+                            # metadata. A terminal choice may carry settlement
+                            # status while a later usage trailer carries the
+                            # amount, so do not couple their accumulation to the
+                            # presence of ``usage`` on this frame.
                             billing_accumulator.update(
                                 self._provider_kind,
                                 billing_chunk,
@@ -3817,125 +4143,132 @@ class OpenAIProvider:
                                     cache_write_tokens=cache_write_tokens,
                                     cache_shape=cache_shape,
                                 )
-                            # Usage was already accounted for above.  Do not let
-                            # the duplicate choice re-enter the normal parser or
-                            # append a second finish reason.
-                            continue
 
-                        # Usage is a cumulative snapshot. Apply it only after
-                        # the frame's outer shape has passed validation; later
-                        # snapshots replace fields they contain and preserve
-                        # details they omit.
-                        usage_payload = chunk.get("usage")
-                        if usage_payload is not None and not isinstance(
-                            usage_payload,
-                            Mapping,
-                        ):
-                            trace.record_error(
-                                code="invalid_stream_frame",
-                                message="Provider stream returned malformed usage",
-                                metadata={"phase": "stream", "cache_shape": cache_shape},
-                            )
-                            yield ErrorEvent(
-                                message=(
-                                    f"{self._compat.display_name} stream returned "
-                                    "malformed usage"
-                                ),
-                                code="invalid_stream_frame",
-                            )
-                            return
-                        # Native billing fields are independent top-level
-                        # metadata. A terminal choice may carry settlement
-                        # status while a later usage trailer carries the
-                        # amount, so do not couple their accumulation to the
-                        # presence of ``usage`` on this frame.
-                        billing_accumulator.update(
-                            self._provider_kind,
-                            billing_chunk,
-                        )
-                        if isinstance(usage_payload, Mapping):
-                            usage_accumulator.update(usage_payload)
-                            (
-                                input_tokens,
-                                output_tokens,
-                                reasoning_tokens,
-                                cached_tokens,
-                                cache_write_tokens,
-                                _,
-                            ) = usage_accumulator.fields()
-                            _log_provider_cache_usage(
-                                provider_kind=self._provider_kind,
-                                model=self._model,
-                                actual_model=actual_model,
-                                input_tokens=input_tokens,
-                                cached_tokens=cached_tokens,
-                                cache_write_tokens=cache_write_tokens,
-                                cache_shape=cache_shape,
-                            )
+                            for choice in raw_choices:
+                                if not isinstance(choice, Mapping):
+                                    yield ErrorEvent(
+                                        message=(
+                                            f"{self._compat.display_name} stream returned "
+                                            "a malformed choice"
+                                        ),
+                                        code="invalid_stream_frame",
+                                    )
+                                    return
+                                choice_index = choice.get("index", 0)
+                                if (
+                                    not isinstance(choice_index, int)
+                                    or isinstance(choice_index, bool)
+                                    or choice_index != 0
+                                ):
+                                    yield ErrorEvent(
+                                        message=(
+                                            f"{self._compat.display_name} stream returned "
+                                            "an unsupported choice index"
+                                        ),
+                                        code="invalid_stream_frame",
+                                    )
+                                    return
+                                active_choice_seen = True
+                                finish = choice.get("finish_reason")
+                                if finish is not None and (
+                                    not isinstance(finish, str) or not finish.strip()
+                                ):
+                                    yield ErrorEvent(
+                                        message=(
+                                            f"{self._compat.display_name} stream returned "
+                                            "an invalid finish reason"
+                                        ),
+                                        code="invalid_stream_frame",
+                                    )
+                                    return
+                                if finish:
+                                    stop_reason = finish
+                                    finish_reasons.append(str(finish))
 
-                        for choice in raw_choices:
-                            if not isinstance(choice, Mapping):
-                                yield ErrorEvent(
-                                    message=(
-                                        f"{self._compat.display_name} stream returned "
-                                        "a malformed choice"
-                                    ),
-                                    code="invalid_stream_frame",
-                                )
-                                return
-                            choice_index = choice.get("index", 0)
-                            if (
-                                not isinstance(choice_index, int)
-                                or isinstance(choice_index, bool)
-                                or choice_index != 0
-                            ):
-                                yield ErrorEvent(
-                                    message=(
-                                        f"{self._compat.display_name} stream returned "
-                                        "an unsupported choice index"
-                                    ),
-                                    code="invalid_stream_frame",
-                                )
-                                return
-                            active_choice_seen = True
-                            finish = choice.get("finish_reason")
-                            if finish is not None and (
-                                not isinstance(finish, str) or not finish.strip()
-                            ):
-                                yield ErrorEvent(
-                                    message=(
-                                        f"{self._compat.display_name} stream returned "
-                                        "an invalid finish reason"
-                                    ),
-                                    code="invalid_stream_frame",
-                                )
-                                return
-                            if finish:
-                                stop_reason = finish
-                                finish_reasons.append(str(finish))
+                                delta = choice.get("delta", {})
+                                if not isinstance(delta, Mapping):
+                                    yield ErrorEvent(
+                                        message=(
+                                            f"{self._compat.display_name} stream returned "
+                                            "a malformed choice delta"
+                                        ),
+                                        code="invalid_stream_frame",
+                                    )
+                                    return
 
-                            delta = choice.get("delta", {})
-                            if not isinstance(delta, Mapping):
-                                yield ErrorEvent(
-                                    message=(
-                                        f"{self._compat.display_name} stream returned "
-                                        "a malformed choice delta"
-                                    ),
-                                    code="invalid_stream_frame",
-                                )
-                                return
+                                # Text content
+                                text = delta.get("content")
+                                if text:
+                                    emitted_stream_event = True
+                                    assistant_text_parts.append(text)
+                                    for visible_text in text_tool_normalizer.push(text):
+                                        text_event = TextDeltaEvent(text=visible_text)
+                                        if text_tool_normalizer.native_lifecycle_deferred:
+                                            _append_coalesced_stream_event(
+                                                deferred_post_native_events,
+                                                text_event,
+                                            )
+                                            if deferred_queue_is_oversized():
+                                                for release_event in release_deferred_queue():
+                                                    if isinstance(
+                                                        release_event,
+                                                        TextDeltaEvent,
+                                                    ):
+                                                        visible_assistant_text_parts.append(
+                                                            release_event.text
+                                                        )
+                                                    yield release_event
+                                        else:
+                                            visible_assistant_text_parts.append(visible_text)
+                                            yield text_event
+                                    if deferred_queue_is_oversized():
+                                        for release_event in release_deferred_queue():
+                                            if isinstance(release_event, TextDeltaEvent):
+                                                visible_assistant_text_parts.append(
+                                                    release_event.text
+                                                )
+                                            yield release_event
 
-                            # Text content
-                            text = delta.get("content")
-                            if text:
-                                emitted_stream_event = True
-                                assistant_text_parts.append(text)
-                                for visible_text in text_tool_normalizer.push(text):
-                                    text_event = TextDeltaEvent(text=visible_text)
+                                # Reasoning content (always parsed, not gated on thinking).
+                                # Streamed in real time as ReasoningDeltaEvent; the
+                                # accumulator also retains the joined text for DoneEvent.
+                                # Counts as an emitted stream event: once the caller
+                                # has received reasoning deltas, an empty-stream or
+                                # timeout fallback retry would deliver (and bill)
+                                # the turn twice.
+                                reasoning_details = delta.get("reasoning_details")
+                                if reasoning_details:
+                                    for detail in reasoning_details:
+                                        if isinstance(detail, dict):
+                                            reasoning_event = reasoning.emit(detail.get("text", ""))
+                                            if reasoning_event is not None:
+                                                emitted_stream_event = True
+                                                if text_tool_normalizer.native_lifecycle_deferred:
+                                                    _append_coalesced_stream_event(
+                                                        deferred_post_native_events,
+                                                        reasoning_event,
+                                                    )
+                                                    if deferred_queue_is_oversized():
+                                                        for (
+                                                            release_event
+                                                        ) in release_deferred_queue():
+                                                            if isinstance(
+                                                                release_event,
+                                                                TextDeltaEvent,
+                                                            ):
+                                                                visible_assistant_text_parts.append(
+                                                                    release_event.text
+                                                                )
+                                                            yield release_event
+                                                else:
+                                                    yield reasoning_event
+                                reasoning_event = reasoning.emit(delta.get("reasoning_content"))
+                                if reasoning_event is not None:
+                                    emitted_stream_event = True
                                     if text_tool_normalizer.native_lifecycle_deferred:
                                         _append_coalesced_stream_event(
                                             deferred_post_native_events,
-                                            text_event,
+                                            reasoning_event,
                                         )
                                         if deferred_queue_is_oversized():
                                             for release_event in release_deferred_queue():
@@ -3948,297 +4281,21 @@ class OpenAIProvider:
                                                     )
                                                 yield release_event
                                     else:
-                                        visible_assistant_text_parts.append(visible_text)
-                                        yield text_event
-                                if deferred_queue_is_oversized():
-                                    for release_event in release_deferred_queue():
-                                        if isinstance(release_event, TextDeltaEvent):
-                                            visible_assistant_text_parts.append(
-                                                release_event.text
-                                            )
-                                        yield release_event
+                                        yield reasoning_event
 
-                            # Reasoning content (always parsed, not gated on thinking).
-                            # Streamed in real time as ReasoningDeltaEvent; the
-                            # accumulator also retains the joined text for DoneEvent.
-                            # Counts as an emitted stream event: once the caller
-                            # has received reasoning deltas, an empty-stream or
-                            # timeout fallback retry would deliver (and bill)
-                            # the turn twice.
-                            reasoning_details = delta.get("reasoning_details")
-                            if reasoning_details:
-                                for detail in reasoning_details:
-                                    if isinstance(detail, dict):
-                                        reasoning_event = reasoning.emit(detail.get("text", ""))
-                                        if reasoning_event is not None:
-                                            emitted_stream_event = True
-                                            if text_tool_normalizer.native_lifecycle_deferred:
-                                                _append_coalesced_stream_event(
-                                                    deferred_post_native_events,
-                                                    reasoning_event,
-                                                )
-                                                if deferred_queue_is_oversized():
-                                                    for (
-                                                        release_event
-                                                    ) in release_deferred_queue():
-                                                        if isinstance(
-                                                            release_event,
-                                                            TextDeltaEvent,
-                                                        ):
-                                                            visible_assistant_text_parts.append(
-                                                                release_event.text
-                                                            )
-                                                        yield release_event
-                                            else:
-                                                yield reasoning_event
-                            reasoning_event = reasoning.emit(delta.get("reasoning_content"))
-                            if reasoning_event is not None:
-                                emitted_stream_event = True
-                                if text_tool_normalizer.native_lifecycle_deferred:
-                                    _append_coalesced_stream_event(
-                                        deferred_post_native_events,
-                                        reasoning_event,
-                                    )
-                                    if deferred_queue_is_oversized():
-                                        for release_event in release_deferred_queue():
-                                            if isinstance(
-                                                release_event,
-                                                TextDeltaEvent,
-                                            ):
-                                                visible_assistant_text_parts.append(
-                                                    release_event.text
-                                                )
-                                            yield release_event
-                                else:
-                                    yield reasoning_event
+                                # Gemini thought_signature on non-FC deltas
+                                # (streamed thinking path): Gemini sends it on
+                                # the top-level delta instead of attaching it to
+                                # a tool_call. Keep it out of the tool accumulator.
+                                ts_delta = delta.get("thought_signature")
+                                if isinstance(ts_delta, str) and ts_delta:
+                                    streamed_thought_signature = ts_delta
 
-                            # Gemini thought_signature on non-FC deltas
-                            # (streamed thinking path): Gemini sends it on
-                            # the top-level delta instead of attaching it to
-                            # a tool_call. Keep it out of the tool accumulator.
-                            ts_delta = delta.get("thought_signature")
-                            if isinstance(ts_delta, str) and ts_delta:
-                                streamed_thought_signature = ts_delta
-
-                            # Tool calls (may stream over multiple chunks)
-                            raw_tool_calls_value = delta.get("tool_calls")
-                            if _has_native_tool_payload(raw_tool_calls_value):
-                                pending_segments = (
-                                    text_tool_normalizer.observe_native_tool_start("")
-                                )
-                                for pending_event in _segment_text_tool_events(
-                                    pending_segments,
-                                    provider_kind=self._provider_kind,
-                                    model=self._model,
-                                ):
-                                    if isinstance(pending_event, TextDeltaEvent):
-                                        visible_assistant_text_parts.append(
-                                            pending_event.text
-                                        )
-                                        emitted_stream_event = True
-                                        yield pending_event
-                            raw_tool_calls = (
-                                []
-                                if raw_tool_calls_value is None
-                                else raw_tool_calls_value
-                            )
-                            if not isinstance(raw_tool_calls, list):
-                                if inert_candidate_output:
-                                    assert candidate_artifact is not None
-                                    candidate_artifact.observe_call(
-                                        ("invalid_tool_calls", candidate_artifact.call_count),
-                                        arguments=strip_candidate_tool_identity(
-                                            raw_tool_calls
-                                        ),
-                                    )
-                                    text_tool_normalizer.observe_native_tool_start("")
-                                    emitted_stream_event = True
-                                else:
-                                    invalid_native_structure += 1
-                                    log.warning(
-                                        "provider.native_tool_call_invalid",
-                                        provider=self._provider_kind,
-                                        model=self._model,
-                                        reason="tool_calls_not_array",
-                                    )
-                                raw_tool_calls = []
-                            for tc in raw_tool_calls:
-                                if not isinstance(tc, Mapping):
-                                    if inert_candidate_output:
-                                        assert candidate_artifact is not None
-                                        candidate_artifact.observe_call(
-                                            ("invalid_tool_call", candidate_artifact.call_count),
-                                            arguments=strip_candidate_tool_identity(tc),
-                                        )
-                                        text_tool_normalizer.observe_native_tool_start("")
-                                        emitted_stream_event = True
-                                    else:
-                                        invalid_native_structure += 1
-                                        log.warning(
-                                            "provider.native_tool_call_invalid",
-                                            provider=self._provider_kind,
-                                            model=self._model,
-                                            reason="tool_call_not_object",
-                                        )
-                                    continue
-                                if (
-                                    self._provider_kind == "dashscope"
-                                    and _dashscope_tool_call_chunk_is_empty(tc)
-                                    and (
-                                        not inert_candidate_output
-                                        or _candidate_malformed_tool_wrapper(tc) is None
-                                    )
-                                ):
-                                    log.warning(
-                                        "dashscope.stream_tool_chunk_sanitized",
-                                        model=self._model,
-                                        reason="empty_tool_call_chunk",
-                                    )
-                                    continue
-                                if inert_candidate_output:
-                                    assert candidate_artifact is not None
-                                    raw_idx = tc.get("index")
-                                    raw_wire_id = tc.get("id")
-                                    if (
-                                        isinstance(raw_idx, int)
-                                        and not isinstance(raw_idx, bool)
-                                        and raw_idx >= 0
-                                    ):
-                                        # A valid provider index is already a
-                                        # bounded stream-local identity. Do not
-                                        # inspect or retain an attacker-sized ID.
-                                        artifact_key: Any = ("index", raw_idx)
-                                    else:
-                                        wire_digest = (
-                                            _candidate_wire_digest(raw_wire_id)
-                                            if isinstance(raw_wire_id, str)
-                                            and raw_wire_id
-                                            else None
-                                        )
-                                        if wire_digest is not None:
-                                            artifact_key = (
-                                                candidate_artifact_wire_keys.get(
-                                                    wire_digest,
-                                                    ("wire_digest", wire_digest),
-                                                )
-                                            )
-                                            candidate_artifact_wire_keys[wire_digest] = (
-                                                artifact_key
-                                            )
-                                        else:
-                                            if (
-                                                "index" not in tc
-                                                and len(candidate_artifact_open_keys) == 1
-                                            ):
-                                                artifact_key = next(
-                                                    iter(candidate_artifact_open_keys)
-                                                )
-                                            else:
-                                                artifact_key = (
-                                                    "sequence",
-                                                    candidate_artifact.call_count,
-                                                )
-                                    raw_function = tc.get("function")
-                                    if isinstance(raw_function, Mapping):
-                                        name_fragment = raw_function.get("name")
-                                        arguments_fragment = raw_function.get("arguments")
-                                    else:
-                                        name_fragment = None
-                                        arguments_fragment = (
-                                            strip_candidate_tool_identity(raw_function)
-                                            if _candidate_fragment_has_content(raw_function)
-                                            else None
-                                        )
-                                    if (
-                                        not _candidate_fragment_has_content(name_fragment)
-                                        and not _candidate_fragment_has_content(
-                                            arguments_fragment
-                                        )
-                                    ):
-                                        malformed_wrapper = (
-                                            _candidate_malformed_tool_wrapper(tc)
-                                        )
-                                        if malformed_wrapper is not None:
-                                            arguments_fragment = malformed_wrapper
-                                    candidate_artifact.append_or_start(
-                                        artifact_key,
-                                        name_fragment=name_fragment,
-                                        arguments_fragment=arguments_fragment,
-                                    )
-                                    text_tool_normalizer.observe_native_tool_start("")
-                                    candidate_artifact_open_keys.add(artifact_key)
-                                    emitted_stream_event = True
-                                    continue
-                                idx, index_valid = _resolve_tool_call_index(tc, tools_acc)
-                                if not index_valid:
-                                    invalid_native_structure += 1
-                                    log.warning(
-                                        "provider.native_tool_call_invalid",
-                                        provider=self._provider_kind,
-                                        model=self._model,
-                                        reason="invalid_tool_call_index",
-                                    )
-                                wire_id = tc.get("id")
-                                wire_id = wire_id if isinstance(wire_id, str) else ""
-                                existing_wire_id = native_wire_ids.get(idx, "")
-                                if (
-                                    existing_wire_id
-                                    and wire_id
-                                    and existing_wire_id != wire_id
-                                ):
-                                    invalid_native_structure += 1
-                                    log.warning(
-                                        "provider.native_tool_call_invalid",
-                                        provider=self._provider_kind,
-                                        model=self._model,
-                                        reason="conflicting_tool_call_id",
-                                    )
-                                    matching_key = tools_acc.find_key_for_tool_call_id(
-                                        wire_id
-                                    )
-                                    idx = (
-                                        cast(int, matching_key)
-                                        if matching_key is not None
-                                        else tools_acc.next_int_key()
-                                    )
-                                if wire_id and idx not in native_wire_ids:
-                                    native_wire_ids[idx] = wire_id
-                                is_new_native_key = not tools_acc.has_key(idx)
-                                if is_new_native_key:
-                                    native_key_order.append(idx)
-                                raw_function = tc.get("function", {}) or {}
-                                if not isinstance(raw_function, Mapping):
-                                    invalid_native_structure += 1
-                                    log.warning(
-                                        "provider.native_tool_call_invalid",
-                                        provider=self._provider_kind,
-                                        model=self._model,
-                                        reason="function_not_object",
-                                    )
-                                    raw_function = {}
-                                function = raw_function
-                                raw_tool_name = function.get("name")
-                                tool_name = (
-                                    raw_tool_name if isinstance(raw_tool_name, str) else ""
-                                )
-                                existing_tool_name = native_tool_names.get(idx, "")
-                                if tool_name.strip():
-                                    if existing_tool_name and existing_tool_name != tool_name:
-                                        invalid_native_structure += 1
-                                        log.warning(
-                                            "provider.native_tool_call_invalid",
-                                            provider=self._provider_kind,
-                                            model=self._model,
-                                            reason="conflicting_tool_name",
-                                        )
-                                    elif not existing_tool_name:
-                                        native_tool_names[idx] = tool_name
-                                effective_tool_name = native_tool_names.get(idx, "")
-                                if is_new_native_key:
+                                # Tool calls (may stream over multiple chunks)
+                                raw_tool_calls_value = delta.get("tool_calls")
+                                if _has_native_tool_payload(raw_tool_calls_value):
                                     pending_segments = (
-                                        text_tool_normalizer.observe_native_tool_start(
-                                            effective_tool_name
-                                        )
+                                        text_tool_normalizer.observe_native_tool_start("")
                                     )
                                     for pending_event in _segment_text_tool_events(
                                         pending_segments,
@@ -4251,169 +4308,651 @@ class OpenAIProvider:
                                             )
                                             emitted_stream_event = True
                                             yield pending_event
-                                raw_arguments_fragment = function.get("arguments", "")
-                                if raw_arguments_fragment is None:
-                                    arguments_fragment = ""
-                                elif isinstance(raw_arguments_fragment, str):
-                                    arguments_fragment = raw_arguments_fragment
-                                else:
-                                    invalid_native_structure += 1
-                                    log.warning(
-                                        "provider.native_tool_call_invalid",
-                                        provider=self._provider_kind,
-                                        model=self._model,
-                                        reason="arguments_fragment_not_string",
-                                    )
-                                    arguments_fragment = ""
-                                tool_events = list(
-                                    tools_acc.append_or_start(
-                                        idx,
-                                        tool_call_id=(
-                                            wire_id or None
-                                        ),
-                                        tool_name=effective_tool_name,
-                                        fragment=arguments_fragment,
-                                    )
+                                raw_tool_calls = (
+                                    []
+                                    if raw_tool_calls_value is None
+                                    else raw_tool_calls_value
                                 )
-                                routed_tool_events: list[StreamEvent] = []
-                                if idx in native_flushed_keys:
-                                    routed_tool_events.extend(tool_events)
-                                else:
-                                    identity_events = (
-                                        pending_native_identity_events.setdefault(
-                                            idx,
-                                            _DeferredStreamEventBuffer(),
+                                if not isinstance(raw_tool_calls, list):
+                                    if inert_candidate_output:
+                                        assert candidate_artifact is not None
+                                        candidate_artifact.observe_call(
+                                            ("invalid_tool_calls", candidate_artifact.call_count),
+                                            arguments=strip_candidate_tool_identity(
+                                                raw_tool_calls
+                                            ),
                                         )
-                                    )
-                                    for tool_event in tool_events:
+                                        text_tool_normalizer.observe_native_tool_start("")
                                         emitted_stream_event = True
-                                        _append_coalesced_stream_event(
-                                            identity_events,
-                                            tool_event,
-                                        )
-                                    while native_identity_flush_index < len(
-                                        native_key_order
-                                    ):
-                                        flush_key = native_key_order[
-                                            native_identity_flush_index
-                                        ]
-                                        known_name = native_tool_names.get(flush_key, "")
-                                        if not known_name:
-                                            break
-                                        flush_buffer = (
-                                            pending_native_identity_events.pop(
-                                                flush_key,
-                                                _DeferredStreamEventBuffer(),
-                                            )
-                                        )
-                                        flush_buffer.patch_start_tool_name(known_name)
-                                        routed_tool_events.extend(flush_buffer.drain())
-                                        native_flushed_keys.add(flush_key)
-                                        native_identity_flush_index += 1
-
-                                    if deferred_queue_is_oversized():
+                                    else:
+                                        invalid_native_structure += 1
                                         log.warning(
-                                            "provider.pending_native_identity_oversized",
+                                            "provider.native_tool_call_invalid",
                                             provider=self._provider_kind,
                                             model=self._model,
-                                            max_events=_MAX_DEFERRED_NATIVE_EVENTS,
-                                            max_argument_chars=(
-                                                _MAX_DEFERRED_NATIVE_ARGUMENT_CHARS
-                                            ),
+                                            reason="tool_calls_not_array",
                                         )
-                                        for release_event in _segment_text_tool_events(
-                                            text_tool_normalizer.finish(
-                                                successful_text_tool_terminal=False,
-                                            ),
+                                    raw_tool_calls = []
+                                for tc in raw_tool_calls:
+                                    if not isinstance(tc, Mapping):
+                                        if inert_candidate_output:
+                                            assert candidate_artifact is not None
+                                            candidate_artifact.observe_call(
+                                                ("invalid_tool_call", candidate_artifact.call_count),
+                                                arguments=strip_candidate_tool_identity(tc),
+                                            )
+                                            text_tool_normalizer.observe_native_tool_start("")
+                                            emitted_stream_event = True
+                                        else:
+                                            invalid_native_structure += 1
+                                            log.warning(
+                                                "provider.native_tool_call_invalid",
+                                                provider=self._provider_kind,
+                                                model=self._model,
+                                                reason="tool_call_not_object",
+                                            )
+                                        continue
+                                    if (
+                                        self._provider_kind == "dashscope"
+                                        and _dashscope_tool_call_chunk_is_empty(tc)
+                                        and (
+                                            not inert_candidate_output
+                                            or _candidate_malformed_tool_wrapper(tc) is None
+                                        )
+                                    ):
+                                        log.warning(
+                                            "dashscope.stream_tool_chunk_sanitized",
+                                            model=self._model,
+                                            reason="empty_tool_call_chunk",
+                                        )
+                                        continue
+                                    if inert_candidate_output:
+                                        assert candidate_artifact is not None
+                                        raw_idx = tc.get("index")
+                                        raw_wire_id = tc.get("id")
+                                        if (
+                                            isinstance(raw_idx, int)
+                                            and not isinstance(raw_idx, bool)
+                                            and raw_idx >= 0
+                                        ):
+                                            # A valid provider index is already a
+                                            # bounded stream-local identity. Do not
+                                            # inspect or retain an attacker-sized ID.
+                                            artifact_key: Any = ("index", raw_idx)
+                                        else:
+                                            wire_digest = (
+                                                _candidate_wire_digest(raw_wire_id)
+                                                if isinstance(raw_wire_id, str)
+                                                and raw_wire_id
+                                                else None
+                                            )
+                                            if wire_digest is not None:
+                                                artifact_key = (
+                                                    candidate_artifact_wire_keys.get(
+                                                        wire_digest,
+                                                        ("wire_digest", wire_digest),
+                                                    )
+                                                )
+                                                candidate_artifact_wire_keys[wire_digest] = (
+                                                    artifact_key
+                                                )
+                                            else:
+                                                if (
+                                                    "index" not in tc
+                                                    and len(candidate_artifact_open_keys) == 1
+                                                ):
+                                                    artifact_key = next(
+                                                        iter(candidate_artifact_open_keys)
+                                                    )
+                                                else:
+                                                    artifact_key = (
+                                                        "sequence",
+                                                        candidate_artifact.call_count,
+                                                    )
+                                        raw_function = tc.get("function")
+                                        if isinstance(raw_function, Mapping):
+                                            name_fragment = raw_function.get("name")
+                                            arguments_fragment = raw_function.get("arguments")
+                                        else:
+                                            name_fragment = None
+                                            arguments_fragment = (
+                                                strip_candidate_tool_identity(raw_function)
+                                                if _candidate_fragment_has_content(raw_function)
+                                                else None
+                                            )
+                                        if (
+                                            not _candidate_fragment_has_content(name_fragment)
+                                            and not _candidate_fragment_has_content(
+                                                arguments_fragment
+                                            )
+                                        ):
+                                            malformed_wrapper = (
+                                                _candidate_malformed_tool_wrapper(tc)
+                                            )
+                                            if malformed_wrapper is not None:
+                                                arguments_fragment = malformed_wrapper
+                                        candidate_artifact.append_or_start(
+                                            artifact_key,
+                                            name_fragment=name_fragment,
+                                            arguments_fragment=arguments_fragment,
+                                        )
+                                        text_tool_normalizer.observe_native_tool_start("")
+                                        candidate_artifact_open_keys.add(artifact_key)
+                                        emitted_stream_event = True
+                                        continue
+                                    idx, index_valid = _resolve_tool_call_index(tc, tools_acc)
+                                    if not index_valid:
+                                        invalid_native_structure += 1
+                                        log.warning(
+                                            "provider.native_tool_call_invalid",
+                                            provider=self._provider_kind,
+                                            model=self._model,
+                                            reason="invalid_tool_call_index",
+                                        )
+                                    wire_id = tc.get("id")
+                                    wire_id = wire_id if isinstance(wire_id, str) else ""
+                                    existing_wire_id = native_wire_ids.get(idx, "")
+                                    if (
+                                        existing_wire_id
+                                        and wire_id
+                                        and existing_wire_id != wire_id
+                                    ):
+                                        invalid_native_structure += 1
+                                        log.warning(
+                                            "provider.native_tool_call_invalid",
+                                            provider=self._provider_kind,
+                                            model=self._model,
+                                            reason="conflicting_tool_call_id",
+                                        )
+                                        matching_key = tools_acc.find_key_for_tool_call_id(
+                                            wire_id
+                                        )
+                                        idx = (
+                                            cast(int, matching_key)
+                                            if matching_key is not None
+                                            else tools_acc.next_int_key()
+                                        )
+                                    if wire_id and idx not in native_wire_ids:
+                                        native_wire_ids[idx] = wire_id
+                                    is_new_native_key = not tools_acc.has_key(idx)
+                                    if is_new_native_key:
+                                        native_key_order.append(idx)
+                                    raw_function = tc.get("function", {}) or {}
+                                    if not isinstance(raw_function, Mapping):
+                                        invalid_native_structure += 1
+                                        log.warning(
+                                            "provider.native_tool_call_invalid",
+                                            provider=self._provider_kind,
+                                            model=self._model,
+                                            reason="function_not_object",
+                                        )
+                                        raw_function = {}
+                                    function = raw_function
+                                    raw_tool_name = function.get("name")
+                                    tool_name = (
+                                        raw_tool_name if isinstance(raw_tool_name, str) else ""
+                                    )
+                                    existing_tool_name = native_tool_names.get(idx, "")
+                                    if tool_name.strip():
+                                        if existing_tool_name and existing_tool_name != tool_name:
+                                            invalid_native_structure += 1
+                                            log.warning(
+                                                "provider.native_tool_call_invalid",
+                                                provider=self._provider_kind,
+                                                model=self._model,
+                                                reason="conflicting_tool_name",
+                                            )
+                                        elif not existing_tool_name:
+                                            native_tool_names[idx] = tool_name
+                                    effective_tool_name = native_tool_names.get(idx, "")
+                                    if is_new_native_key:
+                                        pending_segments = (
+                                            text_tool_normalizer.observe_native_tool_start(
+                                                effective_tool_name
+                                            )
+                                        )
+                                        for pending_event in _segment_text_tool_events(
+                                            pending_segments,
                                             provider_kind=self._provider_kind,
                                             model=self._model,
                                         ):
-                                            if isinstance(release_event, TextDeltaEvent):
+                                            if isinstance(pending_event, TextDeltaEvent):
                                                 visible_assistant_text_parts.append(
-                                                    release_event.text
+                                                    pending_event.text
                                                 )
-                                            yield release_event
-                                        for native_event in deferred_native_events:
-                                            yield native_event
-                                        for post_native_event in deferred_post_native_events:
-                                            if isinstance(
-                                                post_native_event,
-                                                TextDeltaEvent,
-                                            ):
-                                                visible_assistant_text_parts.append(
-                                                    post_native_event.text
+                                                emitted_stream_event = True
+                                                yield pending_event
+                                    raw_arguments_fragment = function.get("arguments", "")
+                                    if raw_arguments_fragment is None:
+                                        arguments_fragment = ""
+                                    elif isinstance(raw_arguments_fragment, str):
+                                        arguments_fragment = raw_arguments_fragment
+                                    else:
+                                        invalid_native_structure += 1
+                                        log.warning(
+                                            "provider.native_tool_call_invalid",
+                                            provider=self._provider_kind,
+                                            model=self._model,
+                                            reason="arguments_fragment_not_string",
+                                        )
+                                        arguments_fragment = ""
+                                    tool_events = list(
+                                        tools_acc.append_or_start(
+                                            idx,
+                                            tool_call_id=(
+                                                wire_id or None
+                                            ),
+                                            tool_name=effective_tool_name,
+                                            fragment=arguments_fragment,
+                                        )
+                                    )
+                                    routed_tool_events: list[StreamEvent] = []
+                                    if idx in native_flushed_keys:
+                                        routed_tool_events.extend(tool_events)
+                                    else:
+                                        identity_events = (
+                                            pending_native_identity_events.setdefault(
+                                                idx,
+                                                _DeferredStreamEventBuffer(),
+                                            )
+                                        )
+                                        for tool_event in tool_events:
+                                            emitted_stream_event = True
+                                            _append_coalesced_stream_event(
+                                                identity_events,
+                                                tool_event,
+                                            )
+                                        while native_identity_flush_index < len(
+                                            native_key_order
+                                        ):
+                                            flush_key = native_key_order[
+                                                native_identity_flush_index
+                                            ]
+                                            known_name = native_tool_names.get(flush_key, "")
+                                            if not known_name:
+                                                break
+                                            flush_buffer = (
+                                                pending_native_identity_events.pop(
+                                                    flush_key,
+                                                    _DeferredStreamEventBuffer(),
                                                 )
-                                            yield post_native_event
-                                        trace.record_error(
-                                            code="incomplete_tool_call",
-                                            message=(
-                                                "Native tool identity remained missing "
-                                                "beyond the bounded queue"
-                                            ),
-                                            metadata={
-                                                "phase": "stream",
-                                                "cache_shape": cache_shape,
-                                            },
-                                        )
-                                        yield ErrorEvent(
-                                            message=(
-                                                f"{self._compat.display_name} returned "
-                                                "an incomplete native tool identity"
-                                            ),
-                                            code="incomplete_tool_call",
-                                        )
-                                        return
-                                for tool_event in routed_tool_events:
-                                    emitted_stream_event = True
-                                    if text_tool_normalizer.native_lifecycle_deferred:
-                                        _append_coalesced_stream_event(
-                                            deferred_native_events,
-                                            tool_event,
-                                        )
+                                            )
+                                            flush_buffer.patch_start_tool_name(known_name)
+                                            routed_tool_events.extend(flush_buffer.drain())
+                                            native_flushed_keys.add(flush_key)
+                                            native_identity_flush_index += 1
+
                                         if deferred_queue_is_oversized():
-                                            for release_event in release_deferred_queue():
-                                                if isinstance(
-                                                    release_event,
-                                                    TextDeltaEvent,
-                                                ):
+                                            log.warning(
+                                                "provider.pending_native_identity_oversized",
+                                                provider=self._provider_kind,
+                                                model=self._model,
+                                                max_events=_MAX_DEFERRED_NATIVE_EVENTS,
+                                                max_argument_chars=(
+                                                    _MAX_DEFERRED_NATIVE_ARGUMENT_CHARS
+                                                ),
+                                            )
+                                            for release_event in _segment_text_tool_events(
+                                                text_tool_normalizer.finish(
+                                                    successful_text_tool_terminal=False,
+                                                ),
+                                                provider_kind=self._provider_kind,
+                                                model=self._model,
+                                            ):
+                                                if isinstance(release_event, TextDeltaEvent):
                                                     visible_assistant_text_parts.append(
                                                         release_event.text
                                                     )
                                                 yield release_event
-                                    else:
-                                        yield tool_event
+                                            for native_event in deferred_native_events:
+                                                yield native_event
+                                            for post_native_event in deferred_post_native_events:
+                                                if isinstance(
+                                                    post_native_event,
+                                                    TextDeltaEvent,
+                                                ):
+                                                    visible_assistant_text_parts.append(
+                                                        post_native_event.text
+                                                    )
+                                                yield post_native_event
+                                            trace.record_error(
+                                                code="incomplete_tool_call",
+                                                message=(
+                                                    "Native tool identity remained missing "
+                                                    "beyond the bounded queue"
+                                                ),
+                                                metadata={
+                                                    "phase": "stream",
+                                                    "cache_shape": cache_shape,
+                                                },
+                                            )
+                                            yield ErrorEvent(
+                                                message=(
+                                                    f"{self._compat.display_name} returned "
+                                                    "an incomplete native tool identity"
+                                                ),
+                                                code="incomplete_tool_call",
+                                            )
+                                            return
+                                    for tool_event in routed_tool_events:
+                                        emitted_stream_event = True
+                                        if text_tool_normalizer.native_lifecycle_deferred:
+                                            _append_coalesced_stream_event(
+                                                deferred_native_events,
+                                                tool_event,
+                                            )
+                                            if deferred_queue_is_oversized():
+                                                for release_event in release_deferred_queue():
+                                                    if isinstance(
+                                                        release_event,
+                                                        TextDeltaEvent,
+                                                    ):
+                                                        visible_assistant_text_parts.append(
+                                                            release_event.text
+                                                        )
+                                                    yield release_event
+                                        else:
+                                            yield tool_event
 
-                                # Gemini thought_signature (OpenAI compat format):
-                                # tool_calls[].extra_content.google.thought_signature
-                                sig = (
-                                    (tc.get("extra_content") or {})
-                                    .get("google", {})
-                                    .get("thought_signature")
-                                )
-                                if isinstance(sig, str) and sig:
-                                    tools_acc.set_metadata(idx, "thought_signature", sig)
+                                    # Gemini thought_signature (OpenAI compat format):
+                                    # tool_calls[].extra_content.google.thought_signature
+                                    sig = (
+                                        (tc.get("extra_content") or {})
+                                        .get("google", {})
+                                        .get("thought_signature")
+                                    )
+                                    if isinstance(sig, str) and sig:
+                                        tools_acc.set_metadata(idx, "thought_signature", sig)
 
-                            if finish:
-                                choice_terminal_seen = True
-                                terminal_finish_reason = finish
-                                terminal_native_finish_reason_present = (
-                                    "native_finish_reason" in choice
-                                )
-                                terminal_native_finish_reason = choice.get(
-                                    "native_finish_reason"
-                                )
+                                if finish:
+                                    choice_terminal_seen = True
+                                    terminal_finish_reason = finish
+                                    terminal_native_finish_reason_present = (
+                                        "native_finish_reason" in choice
+                                    )
+                                    terminal_native_finish_reason = choice.get(
+                                        "native_finish_reason"
+                                    )
 
-                    if malformed_stream_frames:
-                        for pending_event in _segment_text_tool_events(
-                            text_tool_normalizer.finish(
-                                successful_text_tool_terminal=False,
-                            ),
+                        if malformed_stream_frames:
+                            for pending_event in _segment_text_tool_events(
+                                text_tool_normalizer.finish(
+                                    successful_text_tool_terminal=False,
+                                ),
+                                provider_kind=self._provider_kind,
+                                model=self._model,
+                            ):
+                                if isinstance(pending_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(pending_event.text)
+                                yield pending_event
+                            for deferred_event in deferred_native_events:
+                                yield deferred_event
+                            deferred_native_events.clear()
+                            for deferred_event in deferred_post_native_events:
+                                if isinstance(deferred_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(deferred_event.text)
+                                yield deferred_event
+                            deferred_post_native_events.clear()
+                            trace.record_error(
+                                code="invalid_stream_frame",
+                                message="Provider stream contained malformed data frames",
+                                metadata={
+                                    "phase": "stream",
+                                    "cache_shape": cache_shape,
+                                    "malformed_frame_count": malformed_stream_frames,
+                                },
+                            )
+                            yield ErrorEvent(
+                                message=(
+                                    f"{self._compat.display_name} stream contained "
+                                    "a malformed data frame"
+                                ),
+                                code="invalid_stream_frame",
+                            )
+                            return
+
+                        has_terminal_evidence = active_choice_seen and choice_terminal_seen
+                        if not has_terminal_evidence:
+                            if (
+                                self._compat.empty_stream_fallback
+                                and cfg.physical_attempt_limit != 1
+                                and not active_choice_seen
+                                and not emitted_stream_event
+                                and not assistant_text_parts
+                                and not tools_acc.has_calls
+                                and not (
+                                    candidate_artifact is not None
+                                    and candidate_artifact.has_calls
+                                )
+                                and input_tokens == 0
+                                and output_tokens == 0
+                            ):
+                                log.warning(
+                                    "openai.empty_stream_fallback_started",
+                                    provider=self._provider_kind,
+                                    model=self._model,
+                                )
+                                yield ProviderHeartbeatEvent(
+                                    phase="llm_fallback",
+                                    message=(
+                                        "Provider returned an empty stream; retrying "
+                                        "without streaming."
+                                    ),
+                                )
+                                empty_stream_exc = httpx.ReadTimeout("empty stream")
+                                async for fallback_event in self._complete_non_stream(
+                                    payload=payload,
+                                    headers=headers,
+                                    cfg=cfg,
+                                    tools=tools,
+                                    timeout_exc=empty_stream_exc,
+                                ):
+                                    yield fallback_event
+                                return
+                            for pending_event in _segment_text_tool_events(
+                                text_tool_normalizer.finish(
+                                    successful_text_tool_terminal=False,
+                                ),
+                                provider_kind=self._provider_kind,
+                                model=self._model,
+                            ):
+                                if isinstance(pending_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(pending_event.text)
+                                    yield pending_event
+                            for deferred_event in deferred_native_events:
+                                yield deferred_event
+                            deferred_native_events.clear()
+                            for deferred_event in deferred_post_native_events:
+                                if isinstance(deferred_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(deferred_event.text)
+                                yield deferred_event
+                            deferred_post_native_events.clear()
+                            trace.record_error(
+                                code="incomplete_stream",
+                                message="Provider stream ended without terminal evidence",
+                                metadata={"phase": "stream", "cache_shape": cache_shape},
+                            )
+                            yield ErrorEvent(
+                                message=(
+                                    f"{self._compat.display_name} stream ended before a "
+                                    "finish reason"
+                                ),
+                                code="incomplete_stream",
+                            )
+                            return
+
+                        successful_text_tool_terminal = _successful_text_tool_terminal(
+                            saw_done_sentinel=saw_done_sentinel,
+                            finish_reasons=finish_reasons,
+                        )
+                        if not inert_candidate_output:
+                            warn_for_unauthorized_plain_candidate(
+                                "".join(assistant_text_parts),
+                                tools,
+                                dialects=text_tool_dialects,
+                                provider_kind=self._provider_kind,
+                                model=self._model,
+                            )
+
+                        if tools_acc.has_calls and not successful_text_tool_terminal:
+                            for pending_event in _segment_text_tool_events(
+                                text_tool_normalizer.finish(
+                                    successful_text_tool_terminal=False,
+                                ),
+                                provider_kind=self._provider_kind,
+                                model=self._model,
+                            ):
+                                if isinstance(pending_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(pending_event.text)
+                                yield pending_event
+                            for deferred_event in deferred_native_events:
+                                yield deferred_event
+                            deferred_native_events.clear()
+                            for deferred_event in deferred_post_native_events:
+                                if isinstance(deferred_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(deferred_event.text)
+                                yield deferred_event
+                            deferred_post_native_events.clear()
+                            trace.record_error(
+                                code="incomplete_tool_call",
+                                message=(
+                                    "Provider ended a native tool call with an "
+                                    f"unsuccessful finish reason: {stop_reason}"
+                                ),
+                                metadata={"phase": "stream", "cache_shape": cache_shape},
+                            )
+                            yield ErrorEvent(
+                                message=(
+                                    f"{self._compat.display_name} ended a native tool call "
+                                    f"with finish reason {stop_reason!r}"
+                                ),
+                                code="incomplete_tool_call",
+                            )
+                            return
+
+                        # Chat Completions has no per-call stop event: close every
+                        # assembled call once the stream ends, running the
+                        # provider-aware argument parser (including the DashScope
+                        # JSON repair) over the accumulated raw fragments first.
+                        native_calls: list[tuple[str, dict[str, Any]]] = []
+                        pending_native_finishes: list[tuple[Any, dict[str, Any]]] = []
+                        invalid_native_arguments = invalid_native_structure
+                        for key, tool_use_id, tool_name, raw_arguments in (
+                            tools_acc.pending_raw_arguments()
+                        ):
+                            args, arguments_valid, arguments_repaired = _parse_openai_tool_arguments(
+                                provider_kind=self._provider_kind,
+                                model=self._model,
+                                tool_name=tool_name,
+                                tool_use_id=tool_use_id,
+                                raw_text=raw_arguments,
+                                tools_by_name=tools_by_name,
+                            )
+                            trace_tool_calls.append(
+                                {
+                                    "id": tool_use_id,
+                                    "name": tool_name,
+                                    "arguments_raw": raw_arguments,
+                                    "arguments_json_valid": arguments_valid,
+                                    "arguments_json_repaired": arguments_repaired,
+                                    "arguments": args,
+                                }
+                            )
+                            tool_name_valid = bool(tool_name.strip())
+                            if not tool_name_valid:
+                                log.warning(
+                                    "provider.native_tool_call_invalid",
+                                    provider=self._provider_kind,
+                                    model=self._model,
+                                    tool_use_id=tool_use_id,
+                                    reason="missing_tool_name",
+                                )
+                            if not arguments_valid or not tool_name_valid:
+                                invalid_native_arguments += 1
+                                continue
+                            native_calls.append((tool_name, args))
+                            pending_native_finishes.append((key, args))
+
+                        if invalid_native_arguments:
+                            for event in _segment_text_tool_events(
+                                text_tool_normalizer.finish(
+                                    successful_text_tool_terminal=False,
+                                ),
+                                provider_kind=self._provider_kind,
+                                model=self._model,
+                            ):
+                                if isinstance(event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(event.text)
+                                yield event
+                            for deferred_event in deferred_native_events:
+                                yield deferred_event
+                            deferred_native_events.clear()
+                            for deferred_event in deferred_post_native_events:
+                                if isinstance(deferred_event, TextDeltaEvent):
+                                    visible_assistant_text_parts.append(deferred_event.text)
+                                yield deferred_event
+                            deferred_post_native_events.clear()
+                            trace.record_error(
+                                code="incomplete_tool_call",
+                                message="Provider returned invalid native tool arguments",
+                                metadata={
+                                    "phase": "stream",
+                                    "cache_shape": cache_shape,
+                                    "invalid_call_count": invalid_native_arguments,
+                                },
+                            )
+                            yield ErrorEvent(
+                                message=(
+                                    f"{self._compat.display_name} returned invalid "
+                                    "native tool arguments"
+                                ),
+                                code="incomplete_tool_call",
+                            )
+                            return
+
+                        for key, args in pending_native_finishes:
+                            for tool_event in tools_acc.finish_with_arguments(key, args):
+                                emitted_stream_event = True
+                                if text_tool_normalizer.native_lifecycle_deferred:
+                                    deferred_native_events.append(tool_event)
+                                else:
+                                    yield tool_event
+
+                        normalized_segments = text_tool_normalizer.finish(
+                            successful_text_tool_terminal=successful_text_tool_terminal,
+                            native_calls=native_calls,
+                        )
+                        rejection_error = _text_tool_rejection_error(
+                            normalized_segments,
+                            display_name=self._compat.display_name,
+                            provider_kind=self._provider_kind,
+                            model=self._model,
+                            phase="stream",
+                            cache_shape=cache_shape,
+                            trace=trace,
+                        )
+                        if rejection_error is not None:
+                            yield rejection_error
+                            return
+                        for event in _segment_text_tool_events(
+                            normalized_segments,
                             provider_kind=self._provider_kind,
                             model=self._model,
                         ):
-                            if isinstance(pending_event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(pending_event.text)
-                            yield pending_event
+                            emitted_stream_event = True
+                            if isinstance(event, TextDeltaEvent):
+                                visible_assistant_text_parts.append(event.text)
+                            elif isinstance(event, ToolUseEndEvent):
+                                trace_tool_calls.append(
+                                    {
+                                        "id": event.tool_use_id,
+                                        "name": event.tool_name,
+                                        "arguments": event.arguments,
+                                        "synthetic_from_text": True,
+                                    }
+                                )
+                            yield event
+
                         for deferred_event in deferred_native_events:
                             yield deferred_event
                         deferred_native_events.clear()
@@ -4422,30 +4961,53 @@ class OpenAIProvider:
                                 visible_assistant_text_parts.append(deferred_event.text)
                             yield deferred_event
                         deferred_post_native_events.clear()
-                        trace.record_error(
-                            code="invalid_stream_frame",
-                            message="Provider stream contained malformed data frames",
-                            metadata={
-                                "phase": "stream",
-                                "cache_shape": cache_shape,
-                                "malformed_frame_count": malformed_stream_frames,
-                            },
-                        )
-                        yield ErrorEvent(
-                            message=(
-                                f"{self._compat.display_name} stream contained "
-                                "a malformed data frame"
-                            ),
-                            code="invalid_stream_frame",
-                        )
-                        return
 
-                    has_terminal_evidence = active_choice_seen and choice_terminal_seen
-                    if not has_terminal_evidence:
+                        candidate_artifact_text = ""
+                        if candidate_artifact is not None and candidate_artifact.has_content:
+                            if successful_text_tool_terminal:
+                                for artifact_key in candidate_artifact_open_keys:
+                                    candidate_artifact.finish(artifact_key)
+                            candidate_artifact_text = candidate_artifact.render_text()
+                            if candidate_artifact_text:
+                                visible_assistant_text_parts.append(candidate_artifact_text)
+                            log.info(
+                                "provider.candidate_artifact",
+                                provider=self._provider_kind,
+                                model=self._model,
+                                call_count=candidate_artifact.call_count,
+                                event_count=candidate_artifact.event_count,
+                                char_count=candidate_artifact.char_count,
+                                issue_codes=sorted(candidate_artifact.issue_codes),
+                                truncated=False,
+                            )
+
+                        # Assemble reasoning from the structured fields already
+                        # streamed in real time via ReasoningDeltaEvent.
+                        reasoning_text = reasoning.finalize()
+
+                        # Fallback: <think> tag extraction from accumulated text.
+                        # This format embeds reasoning inside the answer text, so it
+                        # can only be recovered after the full text arrives — it is
+                        # inherently non-streamable and stays a turn-end assembly.
+                        caps = cfg.model_capabilities
+                        if not reasoning_text and caps and caps.reasoning_format == "think_tags":
+                            full_text = "".join(assistant_text_parts)
+                            reasoning_text = _extract_think_tags(full_text) or None
+
+                        # Gemini thought_signature: extract from the first tool call
+                        # that carries one (Gemini attaches it to the first FC only).
+                        # Fallback: when Gemini streams the signature on a non-FC
+                        # text delta (no tool_call carries it), use the streamed one.
+                        gemini_thought_sig = cast(
+                            "str | None",
+                            tools_acc.first_metadata("thought_signature"),
+                        )
+                        if gemini_thought_sig is None:
+                            gemini_thought_sig = streamed_thought_signature
+
                         if (
                             self._compat.empty_stream_fallback
                             and cfg.physical_attempt_limit != 1
-                            and not active_choice_seen
                             and not emitted_stream_event
                             and not assistant_text_parts
                             and not tools_acc.has_calls
@@ -4478,572 +5040,282 @@ class OpenAIProvider:
                             ):
                                 yield fallback_event
                             return
-                        for pending_event in _segment_text_tool_events(
-                            text_tool_normalizer.finish(
-                                successful_text_tool_terminal=False,
-                            ),
-                            provider_kind=self._provider_kind,
-                            model=self._model,
-                        ):
-                            if isinstance(pending_event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(pending_event.text)
-                                yield pending_event
-                        for deferred_event in deferred_native_events:
-                            yield deferred_event
-                        deferred_native_events.clear()
-                        for deferred_event in deferred_post_native_events:
-                            if isinstance(deferred_event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(deferred_event.text)
-                            yield deferred_event
-                        deferred_post_native_events.clear()
-                        trace.record_error(
-                            code="incomplete_stream",
-                            message="Provider stream ended without terminal evidence",
-                            metadata={"phase": "stream", "cache_shape": cache_shape},
-                        )
-                        yield ErrorEvent(
-                            message=(
-                                f"{self._compat.display_name} stream ended before a "
-                                "finish reason"
-                            ),
-                            code="incomplete_stream",
-                        )
-                        return
 
-                    successful_text_tool_terminal = _successful_text_tool_terminal(
-                        saw_done_sentinel=saw_done_sentinel,
-                        finish_reasons=finish_reasons,
-                    )
-                    if not inert_candidate_output:
-                        warn_for_unauthorized_plain_candidate(
-                            "".join(assistant_text_parts),
-                            tools,
-                            dialects=text_tool_dialects,
+                        billed_cost, cost_source, billing_receipt = _billing_result(
                             provider_kind=self._provider_kind,
+                            base_url=self._base_url,
+                            usage=usage_accumulator,
+                            billing=billing_accumulator,
                             model=self._model,
                         )
 
-                    if tools_acc.has_calls and not successful_text_tool_terminal:
-                        for pending_event in _segment_text_tool_events(
-                            text_tool_normalizer.finish(
-                                successful_text_tool_terminal=False,
-                            ),
-                            provider_kind=self._provider_kind,
-                            model=self._model,
-                        ):
-                            if isinstance(pending_event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(pending_event.text)
-                            yield pending_event
-                        for deferred_event in deferred_native_events:
-                            yield deferred_event
-                        deferred_native_events.clear()
-                        for deferred_event in deferred_post_native_events:
-                            if isinstance(deferred_event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(deferred_event.text)
-                            yield deferred_event
-                        deferred_post_native_events.clear()
-                        trace.record_error(
-                            code="incomplete_tool_call",
-                            message=(
-                                "Provider ended a native tool call with an "
-                                f"unsuccessful finish reason: {stop_reason}"
-                            ),
-                            metadata={"phase": "stream", "cache_shape": cache_shape},
-                        )
-                        yield ErrorEvent(
-                            message=(
-                                f"{self._compat.display_name} ended a native tool call "
-                                f"with finish reason {stop_reason!r}"
-                            ),
-                            code="incomplete_tool_call",
-                        )
-                        return
-
-                    # Chat Completions has no per-call stop event: close every
-                    # assembled call once the stream ends, running the
-                    # provider-aware argument parser (including the DashScope
-                    # JSON repair) over the accumulated raw fragments first.
-                    native_calls: list[tuple[str, dict[str, Any]]] = []
-                    pending_native_finishes: list[tuple[Any, dict[str, Any]]] = []
-                    invalid_native_arguments = invalid_native_structure
-                    for key, tool_use_id, tool_name, raw_arguments in (
-                        tools_acc.pending_raw_arguments()
-                    ):
-                        args, arguments_valid, arguments_repaired = _parse_openai_tool_arguments(
-                            provider_kind=self._provider_kind,
-                            model=self._model,
-                            tool_name=tool_name,
-                            tool_use_id=tool_use_id,
-                            raw_text=raw_arguments,
-                            tools_by_name=tools_by_name,
-                        )
-                        trace_tool_calls.append(
-                            {
-                                "id": tool_use_id,
-                                "name": tool_name,
-                                "arguments_raw": raw_arguments,
-                                "arguments_json_valid": arguments_valid,
-                                "arguments_json_repaired": arguments_repaired,
-                                "arguments": args,
-                            }
-                        )
-                        tool_name_valid = bool(tool_name.strip())
-                        if not tool_name_valid:
-                            log.warning(
-                                "provider.native_tool_call_invalid",
-                                provider=self._provider_kind,
-                                model=self._model,
-                                tool_use_id=tool_use_id,
-                                reason="missing_tool_name",
-                            )
-                        if not arguments_valid or not tool_name_valid:
-                            invalid_native_arguments += 1
-                            continue
-                        native_calls.append((tool_name, args))
-                        pending_native_finishes.append((key, args))
-
-                    if invalid_native_arguments:
-                        for event in _segment_text_tool_events(
-                            text_tool_normalizer.finish(
-                                successful_text_tool_terminal=False,
-                            ),
-                            provider_kind=self._provider_kind,
-                            model=self._model,
-                        ):
-                            if isinstance(event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(event.text)
-                            yield event
-                        for deferred_event in deferred_native_events:
-                            yield deferred_event
-                        deferred_native_events.clear()
-                        for deferred_event in deferred_post_native_events:
-                            if isinstance(deferred_event, TextDeltaEvent):
-                                visible_assistant_text_parts.append(deferred_event.text)
-                            yield deferred_event
-                        deferred_post_native_events.clear()
-                        trace.record_error(
-                            code="incomplete_tool_call",
-                            message="Provider returned invalid native tool arguments",
-                            metadata={
-                                "phase": "stream",
-                                "cache_shape": cache_shape,
-                                "invalid_call_count": invalid_native_arguments,
+                        trace.record_response(
+                            usage={
+                                "input_tokens": input_tokens,
+                                "output_tokens": output_tokens,
+                                "reasoning_tokens": reasoning_tokens,
+                                "cached_tokens": cached_tokens,
+                                "cache_write_tokens": cache_write_tokens,
+                                "billed_cost": billed_cost,
+                                "cost_source": cost_source,
                             },
+                            stop_reason=stop_reason,
+                            actual_model=actual_model,
+                            assistant_text="".join(visible_assistant_text_parts),
+                            reasoning_content=reasoning_text or None,
+                            tool_calls=trace_tool_calls,
+                            response_ids=sorted(response_ids),
+                            metadata={"cache_shape": cache_shape},
                         )
-                        yield ErrorEvent(
-                            message=(
-                                f"{self._compat.display_name} returned invalid "
-                                "native tool arguments"
-                            ),
-                            code="incomplete_tool_call",
-                        )
-                        return
-
-                    for key, args in pending_native_finishes:
-                        for tool_event in tools_acc.finish_with_arguments(key, args):
-                            emitted_stream_event = True
-                            if text_tool_normalizer.native_lifecycle_deferred:
-                                deferred_native_events.append(tool_event)
-                            else:
-                                yield tool_event
-
-                    normalized_segments = text_tool_normalizer.finish(
-                        successful_text_tool_terminal=successful_text_tool_terminal,
-                        native_calls=native_calls,
-                    )
-                    rejection_error = _text_tool_rejection_error(
-                        normalized_segments,
-                        display_name=self._compat.display_name,
-                        provider_kind=self._provider_kind,
-                        model=self._model,
-                        phase="stream",
-                        cache_shape=cache_shape,
-                        trace=trace,
-                    )
-                    if rejection_error is not None:
-                        yield rejection_error
-                        return
-                    for event in _segment_text_tool_events(
-                        normalized_segments,
-                        provider_kind=self._provider_kind,
-                        model=self._model,
-                    ):
-                        emitted_stream_event = True
-                        if isinstance(event, TextDeltaEvent):
-                            visible_assistant_text_parts.append(event.text)
-                        elif isinstance(event, ToolUseEndEvent):
-                            trace_tool_calls.append(
-                                {
-                                    "id": event.tool_use_id,
-                                    "name": event.tool_name,
-                                    "arguments": event.arguments,
-                                    "synthetic_from_text": True,
-                                }
-                            )
-                        yield event
-
-                    for deferred_event in deferred_native_events:
-                        yield deferred_event
-                    deferred_native_events.clear()
-                    for deferred_event in deferred_post_native_events:
-                        if isinstance(deferred_event, TextDeltaEvent):
-                            visible_assistant_text_parts.append(deferred_event.text)
-                        yield deferred_event
-                    deferred_post_native_events.clear()
-
-                    candidate_artifact_text = ""
-                    if candidate_artifact is not None and candidate_artifact.has_content:
-                        if successful_text_tool_terminal:
-                            for artifact_key in candidate_artifact_open_keys:
-                                candidate_artifact.finish(artifact_key)
-                        candidate_artifact_text = candidate_artifact.render_text()
                         if candidate_artifact_text:
-                            visible_assistant_text_parts.append(candidate_artifact_text)
-                        log.info(
-                            "provider.candidate_artifact",
-                            provider=self._provider_kind,
-                            model=self._model,
-                            call_count=candidate_artifact.call_count,
-                            event_count=candidate_artifact.event_count,
-                            char_count=candidate_artifact.char_count,
-                            issue_codes=sorted(candidate_artifact.issue_codes),
-                            truncated=False,
+                            yield TextDeltaEvent(text=candidate_artifact_text)
+                        yield DoneEvent(
+                            stop_reason=stop_reason,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            reasoning_content=reasoning_text or None,
+                            thinking_signature=gemini_thought_sig,
+                            reasoning_tokens=reasoning_tokens,
+                            cached_tokens=cached_tokens,
+                            cache_write_tokens=cache_write_tokens,
+                            billed_cost=billed_cost,
+                            model=actual_model,
+                            cost_source=cost_source,
+                            provider=self.provider_id,
+                            billing_receipt=billing_receipt,
                         )
 
-                    # Assemble reasoning from the structured fields already
-                    # streamed in real time via ReasoningDeltaEvent.
-                    reasoning_text = reasoning.finalize()
-
-                    # Fallback: <think> tag extraction from accumulated text.
-                    # This format embeds reasoning inside the answer text, so it
-                    # can only be recovered after the full text arrives — it is
-                    # inherently non-streamable and stays a turn-end assembly.
-                    caps = cfg.model_capabilities
-                    if not reasoning_text and caps and caps.reasoning_format == "think_tags":
-                        full_text = "".join(assistant_text_parts)
-                        reasoning_text = _extract_think_tags(full_text) or None
-
-                    # Gemini thought_signature: extract from the first tool call
-                    # that carries one (Gemini attaches it to the first FC only).
-                    # Fallback: when Gemini streams the signature on a non-FC
-                    # text delta (no tool_call carries it), use the streamed one.
-                    gemini_thought_sig = cast(
-                        "str | None",
-                        tools_acc.first_metadata("thought_signature"),
+            except httpx.TimeoutException as exc:
+                safe_error = redact_upstream_error_text(
+                    f"Request timed out: {str(exc) or repr(exc)}",
+                    api_key=self._api_key,
+                    max_len=2000,
+                )
+                trace.record_error(
+                    code="timeout",
+                    message=safe_error,
+                    metadata={"phase": "stream", "cache_shape": cache_shape},
+                )
+                if (
+                    self._compat.stream_timeout_fallback
+                    and cfg.physical_attempt_limit != 1
+                    and not emitted_stream_event
+                ):
+                    event_name = (
+                        "openrouter.stream_timeout_fallback_started"
+                        if self._provider_kind == "openrouter"
+                        else "dashscope.non_stream_fallback_started"
                     )
-                    if gemini_thought_sig is None:
-                        gemini_thought_sig = streamed_thought_signature
-
-                    if (
-                        self._compat.empty_stream_fallback
-                        and cfg.physical_attempt_limit != 1
-                        and not emitted_stream_event
-                        and not assistant_text_parts
-                        and not tools_acc.has_calls
-                        and not (
-                            candidate_artifact is not None
-                            and candidate_artifact.has_calls
-                        )
-                        and input_tokens == 0
-                        and output_tokens == 0
-                    ):
-                        log.warning(
-                            "openai.empty_stream_fallback_started",
-                            provider=self._provider_kind,
-                            model=self._model,
-                        )
-                        yield ProviderHeartbeatEvent(
-                            phase="llm_fallback",
-                            message=(
-                                "Provider returned an empty stream; retrying "
-                                "without streaming."
-                            ),
-                        )
-                        empty_stream_exc = httpx.ReadTimeout("empty stream")
+                    log.warning(
+                        event_name,
+                        model=self._model,
+                        timeout_seconds=cfg.timeout,
+                        timeout_phase=type(exc).__name__,
+                        error=safe_error,
+                    )
+                    yield ProviderHeartbeatEvent(
+                        phase="llm_fallback",
+                        message=(
+                            f"{_provider_display_name(self._provider_kind)} stream timed out; "
+                            "retrying without streaming."
+                        ),
+                    )
+                    try:
                         async for fallback_event in self._complete_non_stream(
                             payload=payload,
                             headers=headers,
                             cfg=cfg,
                             tools=tools,
-                            timeout_exc=empty_stream_exc,
+                            timeout_exc=exc,
                         ):
                             yield fallback_event
-                        return
-
-                    billed_cost, cost_source, billing_receipt = _billing_result(
-                        provider_kind=self._provider_kind,
-                        base_url=self._base_url,
-                        usage=usage_accumulator,
-                        billing=billing_accumulator,
-                        model=self._model,
-                    )
-
-                    trace.record_response(
-                        usage={
-                            "input_tokens": input_tokens,
-                            "output_tokens": output_tokens,
-                            "reasoning_tokens": reasoning_tokens,
-                            "cached_tokens": cached_tokens,
-                            "cache_write_tokens": cache_write_tokens,
-                            "billed_cost": billed_cost,
-                            "cost_source": cost_source,
-                        },
-                        stop_reason=stop_reason,
-                        actual_model=actual_model,
-                        assistant_text="".join(visible_assistant_text_parts),
-                        reasoning_content=reasoning_text or None,
-                        tool_calls=trace_tool_calls,
-                        response_ids=sorted(response_ids),
-                        metadata={"cache_shape": cache_shape},
-                    )
-                    if candidate_artifact_text:
-                        yield TextDeltaEvent(text=candidate_artifact_text)
-                    yield DoneEvent(
-                        stop_reason=stop_reason,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        reasoning_content=reasoning_text or None,
-                        thinking_signature=gemini_thought_sig,
-                        reasoning_tokens=reasoning_tokens,
-                        cached_tokens=cached_tokens,
-                        cache_write_tokens=cache_write_tokens,
-                        billed_cost=billed_cost,
-                        model=actual_model,
-                        cost_source=cost_source,
-                        provider=self.provider_id,
-                        billing_receipt=billing_receipt,
-                    )
-
-        except httpx.TimeoutException as exc:
-            safe_error = redact_upstream_error_text(
-                f"Request timed out: {str(exc) or repr(exc)}",
-                api_key=self._api_key,
-                max_len=2000,
-            )
-            trace.record_error(
-                code="timeout",
-                message=safe_error,
-                metadata={"phase": "stream", "cache_shape": cache_shape},
-            )
-            if (
-                self._compat.stream_timeout_fallback
-                and cfg.physical_attempt_limit != 1
-                and not emitted_stream_event
-            ):
-                event_name = (
-                    "openrouter.stream_timeout_fallback_started"
-                    if self._provider_kind == "openrouter"
-                    else "dashscope.non_stream_fallback_started"
-                )
-                log.warning(
-                    event_name,
+                    except CandidateArtifactLimitError as fallback_exc:
+                        log.warning(
+                            "provider.candidate_artifact_limit",
+                            provider=self._provider_kind,
+                            model=self._model,
+                            phase="non_stream_fallback",
+                            operation=fallback_exc.operation,
+                            reason=fallback_exc.reason,
+                            limit=fallback_exc.limit,
+                            observed=fallback_exc.observed,
+                        )
+                        yield ErrorEvent(
+                            message="Candidate artifact exceeded bounded assembly limits",
+                            code="candidate_artifact_limit_exceeded",
+                        )
+                    except ToolStreamProtocolError as fallback_exc:
+                        log.warning(
+                            "provider.tool_stream_protocol_error",
+                            provider=self._provider_kind,
+                            model=self._model,
+                            phase="non_stream_fallback",
+                            operation=fallback_exc.operation,
+                            reason=fallback_exc.reason,
+                        )
+                        yield ErrorEvent(
+                            message="Provider returned an invalid tool lifecycle",
+                            code="provider_protocol_error",
+                        )
+                    except Exception as fallback_exc:  # noqa: BLE001 - see contract note below
+                        fallback_error = redact_upstream_error_text(
+                            f"Provider response handling failed: "
+                            f"{str(fallback_exc) or repr(fallback_exc)}",
+                            api_key=self._api_key,
+                            max_len=2000,
+                        )
+                        log.error(
+                            "provider.stream_internal_error",
+                            provider=self._provider_kind,
+                            model=self._model,
+                            error=fallback_error,
+                            exception_type=type(fallback_exc).__name__,
+                        )
+                        trace.record_error(code="provider_internal", message=fallback_error)
+                        yield ErrorEvent(
+                            message=fallback_error,
+                            code="provider_internal",
+                        )
+                    return
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.finish(successful_text_tool_terminal=False),
+                    provider_kind=self._provider_kind,
                     model=self._model,
-                    timeout_seconds=cfg.timeout,
-                    timeout_phase=type(exc).__name__,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        yield pending_event
+                for deferred_event in deferred_native_events:
+                    yield deferred_event
+                deferred_native_events.clear()
+                for deferred_event in deferred_post_native_events:
+                    if isinstance(deferred_event, TextDeltaEvent):
+                        visible_assistant_text_parts.append(deferred_event.text)
+                    yield deferred_event
+                deferred_post_native_events.clear()
+                yield ErrorEvent(message=safe_error, code="timeout")
+            except httpx.RequestError as exc:
+                safe_error = redact_upstream_error_text(
+                    f"Request error: {str(exc) or repr(exc)}",
+                    api_key=self._api_key,
+                    max_len=2000,
+                )
+                trace.record_error(
+                    code="request_error",
+                    message=safe_error,
+                    metadata={"phase": "stream", "cache_shape": cache_shape},
+                )
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.finish(successful_text_tool_terminal=False),
+                    provider_kind=self._provider_kind,
+                    model=self._model,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        yield pending_event
+                for deferred_event in deferred_native_events:
+                    yield deferred_event
+                deferred_native_events.clear()
+                for deferred_event in deferred_post_native_events:
+                    if isinstance(deferred_event, TextDeltaEvent):
+                        visible_assistant_text_parts.append(deferred_event.text)
+                    yield deferred_event
+                deferred_post_native_events.clear()
+                yield ErrorEvent(message=safe_error, code="request_error")
+            except CandidateArtifactLimitError as exc:
+                message = "Candidate artifact exceeded bounded assembly limits"
+                log.warning(
+                    "provider.candidate_artifact_limit",
+                    provider=self._provider_kind,
+                    model=self._model,
+                    phase="stream",
+                    operation=exc.operation,
+                    reason=exc.reason,
+                    limit=exc.limit,
+                    observed=exc.observed,
+                )
+                trace.record_error(
+                    code="candidate_artifact_limit_exceeded",
+                    message=message,
+                    metadata={
+                        "phase": "stream",
+                        "cache_shape": cache_shape,
+                        "reason": exc.reason,
+                        "limit": exc.limit,
+                        "observed": exc.observed,
+                    },
+                )
+                deferred_native_events.clear()
+                deferred_post_native_events.clear()
+                yield ErrorEvent(
+                    message=message,
+                    code="candidate_artifact_limit_exceeded",
+                )
+            except ToolStreamProtocolError as exc:
+                message = "Provider returned an invalid tool lifecycle"
+                log.warning(
+                    "provider.tool_stream_protocol_error",
+                    provider=self._provider_kind,
+                    model=self._model,
+                    phase="stream",
+                    operation=exc.operation,
+                    reason=exc.reason,
+                )
+                trace.record_error(
+                    code="provider_protocol_error",
+                    message=message,
+                    metadata={
+                        "phase": "stream",
+                        "cache_shape": cache_shape,
+                        "reason": exc.reason,
+                    },
+                )
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.finish(successful_text_tool_terminal=False),
+                    provider_kind=self._provider_kind,
+                    model=self._model,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        yield pending_event
+                deferred_native_events.clear()
+                deferred_post_native_events.clear()
+                yield ErrorEvent(message=message, code="provider_protocol_error")
+            except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
+                safe_error = redact_upstream_error_text(
+                    f"Provider response handling failed: {str(exc) or repr(exc)}",
+                    api_key=self._api_key,
+                    max_len=2000,
+                )
+                log.error(
+                    "provider.stream_internal_error",
+                    provider=self._provider_kind,
+                    model=self._model,
                     error=safe_error,
+                    exception_type=type(exc).__name__,
                 )
-                yield ProviderHeartbeatEvent(
-                    phase="llm_fallback",
-                    message=(
-                        f"{_provider_display_name(self._provider_kind)} stream timed out; "
-                        "retrying without streaming."
-                    ),
+                trace.record_error(
+                    code="provider_internal",
+                    message=safe_error,
+                    metadata={"phase": "stream", "cache_shape": cache_shape},
                 )
-                try:
-                    async for fallback_event in self._complete_non_stream(
-                        payload=payload,
-                        headers=headers,
-                        cfg=cfg,
-                        tools=tools,
-                        timeout_exc=exc,
-                    ):
-                        yield fallback_event
-                except CandidateArtifactLimitError as fallback_exc:
-                    log.warning(
-                        "provider.candidate_artifact_limit",
-                        provider=self._provider_kind,
-                        model=self._model,
-                        phase="non_stream_fallback",
-                        operation=fallback_exc.operation,
-                        reason=fallback_exc.reason,
-                        limit=fallback_exc.limit,
-                        observed=fallback_exc.observed,
-                    )
-                    yield ErrorEvent(
-                        message="Candidate artifact exceeded bounded assembly limits",
-                        code="candidate_artifact_limit_exceeded",
-                    )
-                except ToolStreamProtocolError as fallback_exc:
-                    log.warning(
-                        "provider.tool_stream_protocol_error",
-                        provider=self._provider_kind,
-                        model=self._model,
-                        phase="non_stream_fallback",
-                        operation=fallback_exc.operation,
-                        reason=fallback_exc.reason,
-                    )
-                    yield ErrorEvent(
-                        message="Provider returned an invalid tool lifecycle",
-                        code="provider_protocol_error",
-                    )
-                except Exception as fallback_exc:  # noqa: BLE001 - see contract note below
-                    fallback_error = redact_upstream_error_text(
-                        f"Provider response handling failed: "
-                        f"{str(fallback_exc) or repr(fallback_exc)}",
-                        api_key=self._api_key,
-                        max_len=2000,
-                    )
-                    log.error(
-                        "provider.stream_internal_error",
-                        provider=self._provider_kind,
-                        model=self._model,
-                        error=fallback_error,
-                        exception_type=type(fallback_exc).__name__,
-                    )
-                    trace.record_error(code="provider_internal", message=fallback_error)
-                    yield ErrorEvent(
-                        message=fallback_error,
-                        code="provider_internal",
-                    )
-                return
-            for pending_event in _segment_text_tool_events(
-                text_tool_normalizer.finish(successful_text_tool_terminal=False),
-                provider_kind=self._provider_kind,
-                model=self._model,
-            ):
-                if isinstance(pending_event, TextDeltaEvent):
-                    yield pending_event
-            for deferred_event in deferred_native_events:
-                yield deferred_event
-            deferred_native_events.clear()
-            for deferred_event in deferred_post_native_events:
-                if isinstance(deferred_event, TextDeltaEvent):
-                    visible_assistant_text_parts.append(deferred_event.text)
-                yield deferred_event
-            deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="timeout")
-        except httpx.RequestError as exc:
-            safe_error = redact_upstream_error_text(
-                f"Request error: {str(exc) or repr(exc)}",
-                api_key=self._api_key,
-                max_len=2000,
-            )
-            trace.record_error(
-                code="request_error",
-                message=safe_error,
-                metadata={"phase": "stream", "cache_shape": cache_shape},
-            )
-            for pending_event in _segment_text_tool_events(
-                text_tool_normalizer.finish(successful_text_tool_terminal=False),
-                provider_kind=self._provider_kind,
-                model=self._model,
-            ):
-                if isinstance(pending_event, TextDeltaEvent):
-                    yield pending_event
-            for deferred_event in deferred_native_events:
-                yield deferred_event
-            deferred_native_events.clear()
-            for deferred_event in deferred_post_native_events:
-                if isinstance(deferred_event, TextDeltaEvent):
-                    visible_assistant_text_parts.append(deferred_event.text)
-                yield deferred_event
-            deferred_post_native_events.clear()
-            yield ErrorEvent(message=safe_error, code="request_error")
-        except CandidateArtifactLimitError as exc:
-            message = "Candidate artifact exceeded bounded assembly limits"
-            log.warning(
-                "provider.candidate_artifact_limit",
-                provider=self._provider_kind,
-                model=self._model,
-                phase="stream",
-                operation=exc.operation,
-                reason=exc.reason,
-                limit=exc.limit,
-                observed=exc.observed,
-            )
-            trace.record_error(
-                code="candidate_artifact_limit_exceeded",
-                message=message,
-                metadata={
-                    "phase": "stream",
-                    "cache_shape": cache_shape,
-                    "reason": exc.reason,
-                    "limit": exc.limit,
-                    "observed": exc.observed,
-                },
-            )
-            deferred_native_events.clear()
-            deferred_post_native_events.clear()
-            yield ErrorEvent(
-                message=message,
-                code="candidate_artifact_limit_exceeded",
-            )
-        except ToolStreamProtocolError as exc:
-            message = "Provider returned an invalid tool lifecycle"
-            log.warning(
-                "provider.tool_stream_protocol_error",
-                provider=self._provider_kind,
-                model=self._model,
-                phase="stream",
-                operation=exc.operation,
-                reason=exc.reason,
-            )
-            trace.record_error(
-                code="provider_protocol_error",
-                message=message,
-                metadata={
-                    "phase": "stream",
-                    "cache_shape": cache_shape,
-                    "reason": exc.reason,
-                },
-            )
-            for pending_event in _segment_text_tool_events(
-                text_tool_normalizer.finish(successful_text_tool_terminal=False),
-                provider_kind=self._provider_kind,
-                model=self._model,
-            ):
-                if isinstance(pending_event, TextDeltaEvent):
-                    yield pending_event
-            deferred_native_events.clear()
-            deferred_post_native_events.clear()
-            yield ErrorEvent(message=message, code="provider_protocol_error")
-        except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
-            safe_error = redact_upstream_error_text(
-                f"Provider response handling failed: {str(exc) or repr(exc)}",
-                api_key=self._api_key,
-                max_len=2000,
-            )
-            log.error(
-                "provider.stream_internal_error",
-                provider=self._provider_kind,
-                model=self._model,
-                error=safe_error,
-                exception_type=type(exc).__name__,
-            )
-            trace.record_error(
-                code="provider_internal",
-                message=safe_error,
-                metadata={"phase": "stream", "cache_shape": cache_shape},
-            )
-            for pending_event in _segment_text_tool_events(
-                text_tool_normalizer.finish(successful_text_tool_terminal=False),
-                provider_kind=self._provider_kind,
-                model=self._model,
-            ):
-                if isinstance(pending_event, TextDeltaEvent):
-                    yield pending_event
-            for deferred_event in deferred_native_events:
-                yield deferred_event
-            deferred_native_events.clear()
-            for deferred_event in deferred_post_native_events:
-                if isinstance(deferred_event, TextDeltaEvent):
-                    visible_assistant_text_parts.append(deferred_event.text)
-                yield deferred_event
-            deferred_post_native_events.clear()
-            yield ErrorEvent(
-                message=safe_error,
-                code="provider_internal",
-            )
+                for pending_event in _segment_text_tool_events(
+                    text_tool_normalizer.finish(successful_text_tool_terminal=False),
+                    provider_kind=self._provider_kind,
+                    model=self._model,
+                ):
+                    if isinstance(pending_event, TextDeltaEvent):
+                        yield pending_event
+                for deferred_event in deferred_native_events:
+                    yield deferred_event
+                deferred_native_events.clear()
+                for deferred_event in deferred_post_native_events:
+                    if isinstance(deferred_event, TextDeltaEvent):
+                        visible_assistant_text_parts.append(deferred_event.text)
+                    yield deferred_event
+                deferred_post_native_events.clear()
+                yield ErrorEvent(
+                    message=safe_error,
+                    code="provider_internal",
+                )
+            break
 
     async def _complete_non_stream(
         self,
