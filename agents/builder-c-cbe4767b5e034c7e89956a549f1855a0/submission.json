@@ -1,0 +1,28 @@
+{
+  "project_title": "RescuePulse — Disaster Intelligence & Rescue Prioritization Engine",
+  "project_description": "RescuePulse turns the chaotic flood of unstructured disaster reports (SMS messages, social media posts, radio transcripts) into a prioritized, actionable rescue plan. During a disaster, emergency command centers are overwhelmed by thousands of fragmented messages — \"300 people trapped on rooftops\", \"bridge washed out\", \"unconfirmed gas leak\" — and manually triaging them costs hours that victims do not have. RescuePulse parses each report into a structured event (category, location, people affected, injured, dead, trapped), scores severity across six explainable dimensions (threat to life 34%, scale 20%, inherent hazard 18%, urgency with 2-hour half-life decay 14%, secondary risk 9%, source credibility 5%), ranks every report from CRITICAL to LOW, and attaches concrete resource bundles (medical teams, rescue teams, helicopters, boats, life jackets) to each priority. It runs fully offline in a single zero-dependency 40KB JavaScript file — deployable on a laptop in a disconnected disaster zone where cloud APIs fail — and is deterministic, so the same input always yields the same plan, enabling drills, audits, and trust. It accepts a single report, a batch file, or a stdin pipe, and exports both plain-text action plans and styled HTML reports for command-center screens.",
+  "code": {
+    "language": "JavaScript (Node.js, CommonJS, zero third-party dependencies)",
+    "size_bytes": 25885,
+    "entrypoint": "node tool.js",
+    "commands": [
+      "node tool.js --self-test",
+      "node tool.js --demo",
+      "node tool.js --demo --html rescue-plan.html",
+      "node tool.js --report \"Landslide near Green Valley, 25 people stranded, 6 injured\"",
+      "node tool.js --reports reports.txt",
+      "echo \"Fire in warehouse district, 15 workers trapped\" | node tool.js --reports -"
+    ],
+    "self_test": "19/19 assertions passed (parsing, count extraction, severity monotonicity, urgency decay, deterministic ranking, HTML well-formedness, no forbidden markers, size limit)",
+    "algorithms": [
+      "keyword-weighted multi-class event detection with event-type priority tiers",
+      "regex-based entity extraction (people, injured, dead, missing, trapped, location)",
+      "six-dimension weighted severity scoring with piecewise-log curves and exponential time decay",
+      "stable multi-criteria priority ranking",
+      "rule-based resource allocation per severity level and disaster category",
+      "FNV-1a hashing for deterministic report IDs"
+    ],
+    "no_forbidden_markers": true,
+    "demo_url_suggestion": "Host rescue-plan.html (generated via --demo --html) on any static host for the demo_url field."
+  }
+}

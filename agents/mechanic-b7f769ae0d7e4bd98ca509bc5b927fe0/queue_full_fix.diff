@@ -1,0 +1,97 @@
+--- a/src/opensquilla/teammate/mailbox.py
++++ b/src/opensquilla/teammate/mailbox.py
+@@ -125,6 +125,25 @@
+                 all_msgs.append(m)
+             self._atomic_write(all_msgs)
+ 
++    def mark_unread(self, messages: list["MailboxMessage"]) -> int:
++        """In-place restore of specific messages to unread (no copy).
++
++        Matches by (from_name, text, timestamp); returns how many restored.
++        """
++        if not messages:
++            return 0
++        keys = {(m.from_name, m.text, m.timestamp) for m in messages}
++        restored = 0
++        with self._lock:
++            all_msgs = self._read_all()
++            for m in all_msgs:
++                if (m.from_name, m.text, m.timestamp) in keys and m.read:
++                    m.read = False
++                    restored += 1
++            if restored:
++                self._atomic_write(all_msgs)
++        return restored
++
+     def clear(self) -> None:
+         with self._lock:
+             self._atomic_write([])
+--- a/src/opensquilla/teammate/llm_executor.py
++++ b/src/opensquilla/teammate/llm_executor.py
+@@ -31,6 +31,7 @@
+ 
+ from opensquilla.engine.teammate import TeammateHandle, TeammateManager
+ from opensquilla.gateway.routing import build_subagent_route_envelope
++from opensquilla.gateway.task_runtime import TaskQueueFullError
+ from opensquilla.session.models import AgentTaskStatus
+ from opensquilla.teammate.mailbox import MailboxMessage
+ from opensquilla.teammate.protocol import (
+@@ -50,6 +51,9 @@
+ )
+ 
+ log = logging.getLogger("opensquilla.teammate.llm_executor")
++
++# Sentinel returned by run_turn when the task queue is full (backpressure).
++TURN_QUEUE_FULL = object()
+ 
+ TERMINAL_OK = frozenset({AgentTaskStatus.SUCCEEDED})
+ TERMINAL_BAD = frozenset(
+@@ -179,12 +183,16 @@
+             run_id=uuid.uuid4().hex,
+             origin="teammate",
+         )
+-        task = await self.task_runtime.enqueue(
+-            envelope,
+-            text,
+-            mode="followup",
+-            run_kind="teammate",
+-        )
++        try:
++            task = await self.task_runtime.enqueue(
++                envelope,
++                text,
++                mode="followup",
++                run_kind="teammate",
++            )
++        except TaskQueueFullError:
++            log.warning("teammate.queue_full_backoff session=%s", handle.session_key)
++            return TURN_QUEUE_FULL
+         self._pending.setdefault(handle.run_id, []).append(
+             _PendingTurn(
+                 handle=handle,
+--- a/src/opensquilla/teammate/runtime.py
++++ b/src/opensquilla/teammate/runtime.py
+@@ -22,6 +22,7 @@
+ log = logging.getLogger("opensquilla.teammate.runtime")
+ 
+ from opensquilla.engine.teammate import TeammateHandle, TeammateManager, team_dir_of
++from opensquilla.teammate.llm_executor import TURN_QUEUE_FULL
+ from opensquilla.teammate.mailbox import Mailbox
+ from opensquilla.teammate.protocol import (
+     NOTIFY_ONLY_TYPES,
+@@ -414,6 +415,15 @@
+                     except Exception:
+                         pass
+                     reply = await self.executor.run_turn(self.manager, handle, message)
++                    if reply is TURN_QUEUE_FULL:
++                        # Backpressure: session pending queue full. Restore unread in place
++                        # (no copy) for this and all later messages, stop this batch. The
++                        # teammate stays alive; next poll retries when slots free up.
++                        try:
++                            mailbox.mark_unread(messages[processed_count:])
++                        except Exception:
++                            pass
++                        break
+                     if reply:
+                         replies.append(f"{handle.name}: {reply}")
+                         turn_summary.append(reply)

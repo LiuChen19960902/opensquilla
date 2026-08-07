@@ -112,6 +112,7 @@ from .types import (
 
 _OPENAI_API_BASE = "https://api.openai.com"
 log = structlog.get_logger(__name__)
+_OPENROUTER_GENERATION_ID_RE = re.compile(r"\Agen-[A-Za-z0-9_-]{1,255}\Z")
 _DASHSCOPE_PARAMETER_RE = re.compile(
     r"<parameter(?:\s[^>]*)?>(?P<body>[\s\S]*?)</parameter>",
     re.IGNORECASE,
@@ -460,6 +461,19 @@ def _base_url_hostname(base_url: str) -> str:
         return ""
 
 
+def _openrouter_generation_id_from_headers(
+    headers: Mapping[str, Any] | None,
+) -> str | None:
+    """Return only a bounded, official-shaped OpenRouter generation ID."""
+
+    if headers is None:
+        return None
+    value = str(headers.get("x-generation-id") or "").strip()
+    if not _OPENROUTER_GENERATION_ID_RE.fullmatch(value):
+        return None
+    return value
+
+
 def _safe_validation_message(value: object) -> str:
     """Return a bounded, single-line, secret-redacted validation detail."""
     if not isinstance(value, str):
@@ -525,7 +539,7 @@ def _tokenrhythm_message_limit_evidence(
         return None
     rows = payload.get("data")
     if not isinstance(rows, list):
-        rows = []
+        return None
 
     limits: list[int] = []
     first_validation_message = ""
@@ -573,6 +587,7 @@ def _tokenrhythm_message_limit_evidence(
         base_host=_base_url_hostname(base_url),
     )
     return proof, first_validation_message
+
 
 
 _TOKENRHYTHM_REASONING_CONTENT_SOFT_LIMIT_DEFAULT = 16_000
@@ -750,27 +765,17 @@ def _tokenrhythm_reasoning_content_limit_evidence(
         if "reasoning_content" in combined_text and any(
             kw in combined_text for kw in ("too_big", "Too big", "长度超过", "允许上限", "at most", "maximum", "Maximum")
         ):
-            # Observed max is the longest reasoning in the wire payload.
             if observed_max_reasoning > 0:
-                # Prefer the exact structured maximum when available; otherwise
-                # fall back to a strictly smaller conservative limit so the
-                # retry makes progress. Use the soft limit as an upper bound
-                # but ensure we actually shrink the offending field.
                 soft = _resolve_tokenrhythm_reasoning_soft_limit()
-                # If soft is disabled, use 8000 as fallback.
                 if soft <= 0:
                     soft = 8000
-                # Shrink to 75% of observed or soft-1000, whichever is smaller,
-                # but at least 1000 to keep head/tail.
                 candidate = min(
                     int(observed_max_reasoning * 0.75),
                     soft - 1000 if soft > 1000 else 8000,
                     8000,
                 )
-                # Ensure candidate is smaller than observed and positive.
                 if candidate < observed_max_reasoning and candidate >= 1000:
                     return candidate, _safe_validation_message(payload_msg or combined_text)
-                # As a last resort, truncate to 8000 if observed is huge.
                 if observed_max_reasoning > 8000:
                     return 8000, _safe_validation_message(payload_msg or combined_text)
         return None
@@ -795,6 +800,50 @@ def _strip_tool_schema_keywords(value: Any, unsupported: frozenset[str]) -> Any:
 _DASHSCOPE_THINKING_BUDGET_ENV = "OPENSQUILLA_DASHSCOPE_THINKING_BUDGET"
 _DASHSCOPE_THINKING_BUDGET_MIN = 1024
 _DASHSCOPE_THINKING_BUDGET_MAX = 38_912
+_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV = "OPENSQUILLA_DASHSCOPE_PARALLEL_TOOL_CALLS"
+_DASHSCOPE_NON_STREAM_FALLBACK_ENV = "OPENSQUILLA_DASHSCOPE_NON_STREAM_FALLBACK"
+
+
+def _dashscope_parallel_tool_calls_from_env() -> bool:
+    """Return the opt-in DashScope parallel tool-call request setting.
+
+    The default and explicit false forms preserve the historical payload by
+    omitting ``parallel_tool_calls``. Invalid values fail closed so benchmark
+    arms cannot silently become null treatments because of a typo.
+    """
+    raw = os.environ.get(_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV)
+    if raw is None or not raw.strip():
+        return False
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_PARALLEL_TOOL_CALLS_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
+
+
+def _dashscope_non_stream_fallback_from_env() -> bool:
+    """Return whether DashScope may retry a stream as a non-stream request.
+
+    The historical default is enabled. Invalid values fail closed at request
+    construction so benchmark manifests cannot claim a strict streaming arm
+    while silently retaining the fallback.
+    """
+    raw = os.environ.get(_DASHSCOPE_NON_STREAM_FALLBACK_ENV)
+    if raw is None or not raw.strip():
+        return True
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_NON_STREAM_FALLBACK_ENV} must be one of "
+        "1/true/yes/on or 0/false/no/off"
+    )
 
 
 def _thinking_budget_tokens_from_env() -> int | None:
@@ -892,11 +941,38 @@ _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS = frozenset(
         "qwen3.6-max-preview",
     }
 )
+_DASHSCOPE_PRESERVE_THINKING_EXPERIMENT_MODEL_IDS = frozenset(
+    {
+        "qwen3.6-flash",
+        "qwen3.6-flash-2026-04-16",
+        "qwen3.7-flash",
+        "qwen3.7-flash-2026-07-15",
+    }
+)
+_DASHSCOPE_PRESERVE_THINKING_ENV = "OPENSQUILLA_DASHSCOPE_PRESERVE_THINKING"
 
 
 def _dashscope_supports_preserve_thinking(model: str) -> bool:
     model_name = model.rsplit("/", 1)[-1].strip().lower()
     return model_name in _DASHSCOPE_PRESERVE_THINKING_MODEL_IDS
+
+
+def _dashscope_preserve_thinking_override_from_env() -> bool | None:
+    """Return an explicit preserve-thinking treatment, or None for model auto-detection."""
+    raw = os.environ.get(_DASHSCOPE_PRESERVE_THINKING_ENV)
+    if raw is None or not raw.strip():
+        return None
+    normalized = raw.strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{_DASHSCOPE_PRESERVE_THINKING_ENV} must be one of "
+        "auto, 1/true/yes/on, or 0/false/no/off"
+    )
 
 
 def _should_send_temperature(
@@ -2788,12 +2864,28 @@ def _should_replay_reasoning_content(
         return True
     if not caps or not caps.supports_reasoning:
         return False
-    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
-        return True
     if caps.reasoning_format == "dashscope":
         if not effective_thinking:
             return False
-        return _dashscope_supports_preserve_thinking(model)
+        supported_by_default = (
+            model_name in policy.preserve_thinking_model_ids
+            or _dashscope_supports_preserve_thinking(model)
+        )
+        override = _dashscope_preserve_thinking_override_from_env()
+        if override is None:
+            return supported_by_default
+        supported_by_override = (
+            supported_by_default
+            or model_name in _DASHSCOPE_PRESERVE_THINKING_EXPERIMENT_MODEL_IDS
+        )
+        if override and not supported_by_override:
+            raise ValueError(
+                f"{_DASHSCOPE_PRESERVE_THINKING_ENV}=on is not supported "
+                f"for DashScope model {model!r}"
+            )
+        return override
+    if effective_thinking and model_name in policy.preserve_thinking_model_ids:
+        return True
     return bool(policy.replay_reasoning_format) and (
         caps.reasoning_format == policy.replay_reasoning_format
     )
@@ -3285,6 +3377,11 @@ class OpenAIProvider:
                 )
                 for tool in tools
             ]
+            if (
+                self._provider_kind == "dashscope"
+                and _dashscope_parallel_tool_calls_from_env()
+            ):
+                payload["parallel_tool_calls"] = True
             if _should_send_tool_choice(self._provider_kind, cfg, caps):
                 payload["tool_choice"] = cfg.tool_choice
         if self._compat.supports_provider_routing_pin:
@@ -3444,6 +3541,20 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        non_stream_fallback_allowed = (
+            self._provider_kind != "dashscope"
+            or _dashscope_non_stream_fallback_from_env()
+        )
+        stream_timeout_fallback = (
+            self._compat.stream_timeout_fallback
+            and cfg.physical_attempt_limit != 1
+            and non_stream_fallback_allowed
+        )
+        empty_stream_fallback = (
+            self._compat.empty_stream_fallback
+            and cfg.physical_attempt_limit != 1
+            and non_stream_fallback_allowed
+        )
         payload, wire_active_user_index, fallback_reason = self._build_payload(
             messages,
             tools,
@@ -3630,6 +3741,7 @@ class OpenAIProvider:
         terminal_native_finish_reason_present = False
         terminal_native_finish_reason: Any = None
         active_choice_seen = False
+        response_ids: set[str] = set()
 
         if os.environ.get("OPENSQUILLA_TRACE_ROUTING"):
             print(
@@ -3718,30 +3830,12 @@ class OpenAIProvider:
         # truncating every reasoning_content to the upstream maximum. The
         # proactive soft limit in _build_payload already prevents most cases;
         # this covers a stricter upstream limit observed in the wild.
-        _tokenrhythm_reasoning_retry_attempts = 0
-        while True:
-            if _tokenrhythm_reasoning_retry_attempts > 0:
-                cache_shape = _payload_cache_shape(payload, tools=tools)
-                trace.record_request(
-                    payload=payload,
-                    headers=headers,
-                    metadata={
-                        "cache_shape": cache_shape,
-                        "timeout_seconds": cfg.timeout,
-                        "tools_count": len(tools or []),
-                        "request_proof": budget_decision.proof,
-                        "retry_reason": "tokenrhythm_reasoning_content_limit",
-                        "retry_attempt": _tokenrhythm_reasoning_retry_attempts,
-                    },
-                )
+        for _tokenrhythm_reasoning_retry_attempt in range(2):
             try:
                 async with httpx.AsyncClient(
                     timeout=(
                         _stream_timeout(cfg.timeout)
-                        if (
-                            self._compat.stream_timeout_fallback
-                            and cfg.physical_attempt_limit != 1
-                        )
+                        if stream_timeout_fallback
                         else cfg.timeout
                     ),
                     trust_env=_trust_env(),
@@ -3762,6 +3856,14 @@ class OpenAIProvider:
                         headers=headers,
                         json=payload,
                     ) as response:
+                        response_generation_id = _openrouter_generation_id_from_headers(
+                            response.headers
+                        )
+                        if response_generation_id:
+                            response_ids.add(response_generation_id)
+                            trace.record_response_headers(
+                                response_ids=[response_generation_id]
+                            )
                         if self._compat.attribution_response_headers:
                             attribution = {
                                 name: response.headers[name]
@@ -3809,7 +3911,7 @@ class OpenAIProvider:
                             )
                             if (
                                 reasoning_limit_evidence is not None
-                                and _tokenrhythm_reasoning_retry_attempts == 0
+                                and _tokenrhythm_reasoning_retry_attempt == 0
                             ):
                                 limit, validation_message = reasoning_limit_evidence
                                 changed = _apply_tokenrhythm_reasoning_soft_limit_to_payload(
@@ -3822,7 +3924,7 @@ class OpenAIProvider:
                                         model=self._model,
                                         limit=limit,
                                         validation_message=validation_message,
-                                        retry_attempt=_tokenrhythm_reasoning_retry_attempts + 1,
+                                        retry_attempt=_tokenrhythm_reasoning_retry_attempt + 1,
                                     )
                                     trace.record_error(
                                         code=str(response.status_code),
@@ -3834,7 +3936,6 @@ class OpenAIProvider:
                                             "validation_message": validation_message,
                                         },
                                     )
-                                    _tokenrhythm_reasoning_retry_attempts += 1
                                     continue
 
                             message_limit_evidence = _tokenrhythm_message_limit_evidence(
@@ -3919,7 +4020,6 @@ class OpenAIProvider:
                             )
                             return
 
-                        response_ids: set[str] = set()
                         trace_tool_calls: list[dict[str, Any]] = []
                         async for line in response.aiter_lines():
                             if not line.startswith("data:"):
@@ -4714,8 +4814,7 @@ class OpenAIProvider:
                         has_terminal_evidence = active_choice_seen and choice_terminal_seen
                         if not has_terminal_evidence:
                             if (
-                                self._compat.empty_stream_fallback
-                                and cfg.physical_attempt_limit != 1
+                                empty_stream_fallback
                                 and not active_choice_seen
                                 and not emitted_stream_event
                                 and not assistant_text_parts
@@ -5006,8 +5105,7 @@ class OpenAIProvider:
                             gemini_thought_sig = streamed_thought_signature
 
                         if (
-                            self._compat.empty_stream_fallback
-                            and cfg.physical_attempt_limit != 1
+                            empty_stream_fallback
                             and not emitted_stream_event
                             and not assistant_text_parts
                             and not tools_acc.has_calls
@@ -5085,6 +5183,13 @@ class OpenAIProvider:
                             billing_receipt=billing_receipt,
                         )
 
+            except asyncio.CancelledError:
+                trace.record_error(
+                    code="cancelled",
+                    message="Provider request cancelled",
+                    metadata={"phase": "stream", "cache_shape": cache_shape},
+                )
+                raise
             except httpx.TimeoutException as exc:
                 safe_error = redact_upstream_error_text(
                     f"Request timed out: {str(exc) or repr(exc)}",
@@ -5096,11 +5201,7 @@ class OpenAIProvider:
                     message=safe_error,
                     metadata={"phase": "stream", "cache_shape": cache_shape},
                 )
-                if (
-                    self._compat.stream_timeout_fallback
-                    and cfg.physical_attempt_limit != 1
-                    and not emitted_stream_event
-                ):
+                if stream_timeout_fallback and not emitted_stream_event:
                     event_name = (
                         "openrouter.stream_timeout_fallback_started"
                         if self._provider_kind == "openrouter"
@@ -5419,6 +5520,14 @@ class OpenAIProvider:
             )
             yield ErrorEvent(message=safe_error, code="request_error")
             return
+
+        response_ids: set[str] = set()
+        response_generation_id = _openrouter_generation_id_from_headers(
+            response.headers
+        )
+        if response_generation_id:
+            response_ids.add(response_generation_id)
+            trace.record_response_headers(response_ids=[response_generation_id])
 
         if response.status_code != 200:
             safe_response_body = redact_upstream_error_text(
@@ -5979,6 +6088,9 @@ class OpenAIProvider:
         ):
             reasoning_text = _extract_think_tags("".join(assistant_text_parts)) or None
 
+        response_id = data.get("id")
+        if isinstance(response_id, str) and response_id:
+            response_ids.add(response_id)
         trace.record_response(
             response=data,
             usage={
@@ -5995,7 +6107,7 @@ class OpenAIProvider:
             assistant_text="".join(visible_assistant_text_parts),
             reasoning_content=reasoning_text or None,
             tool_calls=trace_tool_calls,
-            response_ids=[str(data["id"])] if data.get("id") else [],
+            response_ids=sorted(response_ids),
             metadata={"cache_shape": cache_shape},
         )
         if candidate_artifact_text:
