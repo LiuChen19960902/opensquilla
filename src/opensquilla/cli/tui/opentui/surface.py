@@ -151,6 +151,9 @@ class OpenTuiOutputHandle:
         Emits a ``teammate`` block (colored member name + white body) into the
         transcript so the lead sees the team conversation in real time without
         waiting for the next history reload.
+
+        For streaming callers, prefer the begin/append/end trio below — it
+        coalesces rapid deltas and avoids one-block-per-token overhead.
         """
         block_id = f"teammate-{self._attachment_seq}"
         self._attachment_seq += 1
@@ -162,6 +165,36 @@ class OpenTuiOutputHandle:
                 meta={"text": f"{from_name}: {text}"},
             ),
         )
+        await self._bridge.send("block.end", BlockEnd(id=block_id))
+
+    async def present_teammate_begin(self, from_name: str, text: str = "") -> str:
+        """Begin a streaming teammate block. Returns the block_id for append/end."""
+        block_id = f"teammate-{self._attachment_seq}"
+        self._attachment_seq += 1
+        await self._bridge.send(
+            "block.begin",
+            BlockBegin(
+                id=block_id,
+                kind="teammate",
+                meta={"text": f"{from_name}: {text}", "from": from_name},
+            ),
+        )
+        return block_id
+
+    async def present_teammate_append(self, block_id: str, delta: str) -> None:
+        """Append streaming delta to an active teammate block."""
+        from opensquilla.cli.tui.opentui.messages import BlockAppend  # noqa: PLC0415
+
+        await self._bridge.send("block.append", BlockAppend(id=block_id, delta=delta))
+
+    async def present_teammate_update(self, block_id: str, patch: dict[str, object]) -> None:
+        """Update a teammate block's meta (e.g. token count, status)."""
+        from opensquilla.cli.tui.opentui.messages import BlockUpdate  # noqa: PLC0415
+
+        await self._bridge.send("block.update", BlockUpdate(id=block_id, patch=patch))
+
+    async def present_teammate_end(self, block_id: str) -> None:
+        """Close a streaming teammate block (triggers collapsed preview if long)."""
         await self._bridge.send("block.end", BlockEnd(id=block_id))
 
     async def add_attachment(

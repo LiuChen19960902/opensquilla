@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- TUI `/rewind` command rewinds a conversation from an earlier user message:
+  it forks the active session into a new child session that keeps everything
+  before the chosen message, activates it, and preloads the composer with the
+  message text so the user can edit and resend — the terminal equivalent of
+  the WebUI's edit/regenerate actions. Run `/rewind` with no argument to open
+  an interactive picker (arrow keys + Enter, filter by typing) listing the
+  user messages, then pick one to rewind to; `/rewind <#|message-id>` skips
+  the picker. The original session is left untouched.
 - Official TokenRhythm HTTPS API requests can now include the optional
   `X-OpenSquilla-Install-Id` header by default. It carries the existing
   pseudonymous, cross-session installation identifier without exposing raw

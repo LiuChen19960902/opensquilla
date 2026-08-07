@@ -49,13 +49,34 @@ def _resolve_reasoning_effort(level: ThinkingLevel | None, budget: int) -> str:
         return "high"
 
 
-def _resolve_deepseek_reasoning_effort(level: ThinkingLevel | None) -> str:
-    """Map OpenSquilla thinking levels to DeepSeek V4's documented effort values."""
+def _resolve_deepseek_reasoning_effort(
+    level: ThinkingLevel | None, model: str = ""
+) -> str:
+    """Map OpenSquilla thinking levels to DeepSeek V4's documented effort values.
+
+    tokenrhythm 的 0731 要求 HIGH/XHIGH/MAX 均映射为 max；其余平台
+    保持 XHIGH/MAX→max。
+    """
     from opensquilla.engine.types import (
         ThinkingLevel,  # local: avoids circular import at module load
     )
 
+    if level == ThinkingLevel.MAX:
+        return "max"
     if level == ThinkingLevel.XHIGH:
+        return "max"
+    if level == ThinkingLevel.HIGH and "0731" in model.lower():
+        return "max"
+    return "high"
+
+
+def _resolve_qwen_deepseek_reasoning_effort(level: ThinkingLevel | None) -> str:
+    """Qwen Token Plan 侧的 deepseek/glm 仍兼容 XHIGH→max（保留旧文档映射）。"""
+    from opensquilla.engine.types import (
+        ThinkingLevel,  # local: avoids circular import at module load
+    )
+
+    if level in (ThinkingLevel.MAX, ThinkingLevel.XHIGH):
         return "max"
     return "high"
 
@@ -119,7 +140,9 @@ def _enable_reasoning_effort(payload: dict[str, Any], args: ReasoningEnableArgs)
 
 def _enable_deepseek(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
     payload["thinking"] = {"type": "enabled"}
-    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(args.thinking_level)
+    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(
+        args.thinking_level, args.model
+    )
 
 
 def _enable_tencent_tokenhub(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
@@ -164,14 +187,14 @@ def _enable_qwen_token_plan_deepseek(
     payload: dict[str, Any], args: ReasoningEnableArgs
 ) -> None:
     payload["enable_thinking"] = True
-    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(args.thinking_level)
+    payload["reasoning_effort"] = _resolve_qwen_deepseek_reasoning_effort(args.thinking_level)
 
 
 def _enable_qwen_token_plan_glm(
     payload: dict[str, Any], args: ReasoningEnableArgs
 ) -> None:
     payload["enable_thinking"] = True
-    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(
+    payload["reasoning_effort"] = _resolve_qwen_deepseek_reasoning_effort(
         args.thinking_level
     )
 

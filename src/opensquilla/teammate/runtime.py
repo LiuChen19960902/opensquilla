@@ -119,7 +119,7 @@ class TeammateRuntime:
     def __init__(
         self,
         manager: TeammateManager,
-        poll_interval: float = 1.0,
+        poll_interval: float = 0.25,
         executor: Any = None,
         shutdown_timeout: float | None = 30.0,
         idle_timeout: float | None = None,
@@ -127,6 +127,9 @@ class TeammateRuntime:
     ):
         self.manager = manager
         self.poll_interval = poll_interval
+        # Event-driven wake-up: send_message() can nudge the loop immediately
+        # instead of waiting for the next poll_interval tick.
+        self._wake: asyncio.Event | None = None
         # Executor protocol (duck-typed):
         #   run_turn(manager, handle, message) -> str | None
         #       None = async turn submitted (collected later via collect_completed)
@@ -139,6 +142,11 @@ class TeammateRuntime:
         self.idle_timeout = idle_timeout
         self.visible_sink = visible_sink
         self._running = False
+        # Wire event-driven wake so manager.send_message() can nudge the loop.
+        try:
+            self.manager._on_message = self.notify  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
     # ── reply routing (peer-to-peer, Claude Code SendMessage) ──────────
     async def _push_visible(
@@ -393,6 +401,26 @@ class TeammateRuntime:
         self._enforce_shutdown_timeout(team_id)
         return replies
 
+    def notify(self) -> None:
+        """Wake the poll loop immediately (called after send_message)."""
+        if self._wake is not None and not self._wake.is_set():
+            self._wake.set()
+
+    async def _sleep_or_wake(self, stop: asyncio.Event | None) -> None:
+        if self._wake is None:
+            self._wake = asyncio.Event()
+        else:
+            self._wake.clear()
+        # Wait for either the interval or an explicit notify(), plus stop signal.
+        try:
+            await asyncio.wait_for(
+                self._wake.wait(), timeout=self.poll_interval
+            )
+        except asyncio.TimeoutError:
+            pass
+        if stop is not None and stop.is_set():
+            return
+
     async def run(
         self, team_id: str, stop: asyncio.Event | None = None
     ) -> None:
@@ -403,6 +431,7 @@ class TeammateRuntime:
         force-shutdown and the loop exits.
         """
         self._running = True
+        self._wake = asyncio.Event()
         try:
             while not (stop is not None and stop.is_set()):
                 await self.poll_once(team_id)
@@ -420,9 +449,10 @@ class TeammateRuntime:
                     ]
                     if not live:
                         break
-                await asyncio.sleep(self.poll_interval)
+                await self._sleep_or_wake(stop)
         finally:
             self._running = False
+            self._wake = None
 
     async def run_all(self, stop: asyncio.Event | None = None) -> None:
         """Resident loop over ALL teams (gateway mode).
@@ -432,6 +462,7 @@ class TeammateRuntime:
         Per-team failures are isolated so one bad team never kills the loop.
         """
         self._running = True
+        self._wake = asyncio.Event()
         try:
             while not (stop is not None and stop.is_set()):
                 teams = self.manager.registry.list_teams()
@@ -442,6 +473,7 @@ class TeammateRuntime:
                             self._enforce_idle_timeout(team.id)
                     except Exception:  # pragma: no cover - defensive
                         pass
-                await asyncio.sleep(self.poll_interval)
+                await self._sleep_or_wake(stop)
         finally:
             self._running = False
+            self._wake = None

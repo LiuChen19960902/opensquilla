@@ -37,9 +37,11 @@ from opensquilla.teammate.protocol import (
     NOTIFY_ONLY_TYPES,
     TYPE_PLAN_APPROVAL_RESPONSE,
     TYPE_SHUTDOWN_REQUEST,
+    TYPE_STEER,
     TYPE_TASK_ASSIGNMENT,
     FIELD_APPROVE,
     FIELD_FEEDBACK,
+    FIELD_INSTRUCTION,
     FIELD_PLAN,
     FIELD_REQUEST_ID,
     FIELD_SUBJECT,
@@ -90,6 +92,9 @@ def format_turn_text(message: MailboxMessage) -> str:
         return f"[task_assignment from {by}] {subject}\n{description}".strip()
     if mtype == "shutdown_request":
         return f"[shutdown_request] {body.get('reason', '')}".strip()
+    if mtype == TYPE_STEER:
+        instruction = body.get(FIELD_INSTRUCTION, "") or body.get("instruction", "")
+        return f"[steer from {message.from_name}] {instruction}".strip()
     if mtype == TYPE_PLAN_APPROVAL_RESPONSE:
         approve = body.get(FIELD_APPROVE)
         feedback = body.get(FIELD_FEEDBACK, "")

@@ -151,6 +151,8 @@ class TeammateManager:
         self.registry = registry
         self.handles = TeammateRegistry()
         self.executor = executor
+        # Optional wake hook set by TeammateRuntime to get event-driven polling.
+        self._on_message: Any = None
 
     # ── lifecycle ──────────────────────────────────────────────────────
     def spawn_teammate(
@@ -206,7 +208,14 @@ class TeammateManager:
             inbox = Mailbox.open(team_dir_of(self.registry, team_id), to_name)
         else:
             inbox = handle.mailbox
-        return inbox.send(sender, body)
+        result = inbox.send(sender, body)
+        # Event-driven wake: nudge the runtime without waiting for poll_interval.
+        try:
+            if self._on_message is not None:
+                self._on_message()
+        except Exception:
+            pass
+        return result
 
     def request_shutdown(self, team_id: str, name: str, reason: str = "") -> str:
         """Send a shutdown request and mark the teammate shutting_down."""

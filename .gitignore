@@ -124,3 +124,6 @@ opensquilla-webui/public/music/playlist.local.json
 
 # Isolated local implementation worktrees.
 /.worktrees/
+
+# 本地 TUI 启动脚本（含本机路径，不入库）
+/tui.sh

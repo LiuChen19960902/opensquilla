@@ -16,6 +16,7 @@ import {
 } from "./screenMode.mjs";
 import { createTurnFlow, createTurnView } from "./turnView.mjs";
 import { createWelcomeView } from "./welcomeView.mjs";
+import { createTeamWidget } from "./teamWidget.mjs";
 import { HOST_PROTOCOL_VERSION, connectIpcFromEnv, createDispatcher } from "./ipc.mjs";
 import {
   installTerminalViewportRecovery,
@@ -164,6 +165,13 @@ async function main() {
   let surfaceRecovery = null;
   let flow = null;
   let composer = null;
+  let teamWidget = null;
+  try {
+    teamWidget = createTeamWidget({ renderer, BoxRenderable, TextRenderable, container: conversationBox });
+    onThemeApplied(() => teamWidget?.recolor?.());
+  } catch {
+    teamWidget = null;
+  }
   const transcriptScroller = createStableTranscriptScroller({
     scrollBox: conversationBox,
     renderer,
@@ -448,6 +456,11 @@ async function main() {
     },
     blockEnd: (m) => {
       withBottomFollow(() => flow.active()?.end(m.id));
+    },
+    teamUpdate: (m) => {
+      try {
+        teamWidget?.update?.(m.team_id ?? m.teamId ?? m.id, m.members ?? m.teammates ?? []);
+      } catch {}
     },
     // prompt.echo arrives BEFORE turn.begin (it is emitted by the input-echo
     // hook) — and it also fires immediately for a submission QUEUED behind a

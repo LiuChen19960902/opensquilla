@@ -33,6 +33,10 @@ TYPE_SHUTDOWN_REJECTED = "shutdown_rejected"
 TYPE_HEARTBEAT = "heartbeat"
 TYPE_IDLE_NOTIFICATION = "idle_notification"
 TYPE_ACK = "ack"
+# ── Steering & orchestration (pi-subagents parity) ───────────────────
+TYPE_STEER = "steer"
+TYPE_PROGRESS = "progress"
+TYPE_SUBAGENT_RESULT = "subagent_result"
 
 # ── Notify-only message types ──────────────────────────────────────────
 # Messages that carry information but NEVER expect a reply. A teammate
@@ -47,6 +51,8 @@ NOTIFY_ONLY_TYPES = frozenset({
     TYPE_IDLE_NOTIFICATION,
     TYPE_HEARTBEAT,
     TYPE_ACK,
+    TYPE_PROGRESS,
+    TYPE_SUBAGENT_RESULT,
 })
 
 # ── Field names shared by typed bodies ────────────────────────────────
@@ -65,6 +71,9 @@ FIELD_FEEDBACK = "feedback"
 FIELD_IDLE_REASON = "idleReason"
 FIELD_SUMMARY = "summary"
 FIELD_COMPLETED_TASK_ID = "completedTaskId"
+FIELD_INSTRUCTION = "instruction"
+FIELD_PROGRESS = "progress"
+FIELD_TOKENS = "tokens"
 
 # Message envelope fields
 FIELD_FROM = "from"

@@ -161,6 +161,33 @@ def test_deepseek_enable_payload_maps_levels_to_documented_efforts() -> None:
         "thinking": {"type": "enabled"},
         "reasoning_effort": "max",
     }
+    max_level = ReasoningEnableArgs(thinking_level=ThinkingLevel.MAX, thinking_budget_tokens=5000)
+    assert _enabled("deepseek", max_level) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+    # tokenrhythm 0731: HIGH/XHIGH/MAX -> max
+    high_0731 = ReasoningEnableArgs(
+        thinking_level=ThinkingLevel.HIGH, thinking_budget_tokens=5000, model="deepseek-v4-flash-0731"
+    )
+    assert _enabled("deepseek", high_0731) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+    xhigh_0731 = ReasoningEnableArgs(
+        thinking_level=ThinkingLevel.XHIGH, thinking_budget_tokens=5000, model="deepseek-v4-flash-0731"
+    )
+    assert _enabled("deepseek", xhigh_0731) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
+    max_0731 = ReasoningEnableArgs(
+        thinking_level=ThinkingLevel.MAX, thinking_budget_tokens=5000, model="deepseek-v4-flash-0731"
+    )
+    assert _enabled("deepseek", max_0731) == {
+        "thinking": {"type": "enabled"},
+        "reasoning_effort": "max",
+    }
 
 
 def test_deepseek_disable_payload() -> None:

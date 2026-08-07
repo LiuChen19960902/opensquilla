@@ -838,7 +838,7 @@ _THINKING_ALIASES: Final[dict[str, str]] = {
     "extra_high": "xhigh",
     "extra high": "xhigh",
     "highest": "high",
-    "max": "high",
+    "max": "max",
     "on": "low",
     "true": "medium",
     "none": "off",

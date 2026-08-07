@@ -76,11 +76,12 @@ def _team_id_of(params: dict[str, Any]) -> str:
         "name": {"type": "string", "description": "Teammate name (unique within the team)."},
         "prompt": {"type": "string", "description": "Teammate role/system prompt."},
         "model": {"type": "string", "description": "Optional model override."},
+        "agent_type": {"type": "string", "description": "Optional custom agent type (from teammate_agents). If set, prompt is merged with the type's template when prompt is empty."},
     },
     required=["team_name", "name", "prompt"],
 )
 async def teammate_create(
-    team_name: str, name: str, prompt: str, model: str | None = None
+    team_name: str, name: str, prompt: str, model: str | None = None, agent_type: str | None = None
 ) -> str:
     manager = _get_manager()
     # Record the caller's session as the team lead's visible session so the
@@ -93,6 +94,13 @@ async def teammate_create(
         lead_agent_id="team-lead",
         lead_session_key=lead_session_key,
     )
+    # Resolve agent_type template if prompt is empty or explicitly requested
+    if agent_type:
+        resolved = _resolve_agent_type(agent_type)
+        if resolved:
+            if not prompt.strip():
+                prompt = resolved["prompt"]
+            model = model or resolved.get("model")
     handle = manager.spawn_teammate(team.id, name, prompt, model=model)
     return json.dumps(
         {"team_id": team.id, "agent_id": handle.agent_id, "status": handle.status},
@@ -117,16 +125,23 @@ async def teammate_create(
         "name": {"type": "string", "description": "Teammate name (unique within the team)."},
         "prompt": {"type": "string", "description": "Teammate role/system prompt."},
         "model": {"type": "string", "description": "Optional model override."},
+        "agent_type": {"type": "string", "description": "Optional custom agent type (from teammate_agents)."},
     },
     required=["team_id", "name", "prompt"],
 )
 async def teammate_spawn(
-    team_id: str, name: str, prompt: str, model: str | None = None
+    team_id: str, name: str, prompt: str, model: str | None = None, agent_type: str | None = None
 ) -> str:
     manager = _get_manager()
     team = manager.registry.get_team(team_id)
     if team is None:
         raise ToolError(f"no team '{team_id}'")
+    if agent_type:
+        resolved = _resolve_agent_type(agent_type)
+        if resolved:
+            if not prompt.strip():
+                prompt = resolved["prompt"]
+            model = model or resolved.get("model")
     handle = manager.spawn_teammate(team.id, name, prompt, model=model)
     return json.dumps(
         {"team_id": team.id, "agent_id": handle.agent_id, "status": handle.status},
@@ -469,7 +484,296 @@ async def teammate_status(team_id: str) -> str:
     return json.dumps(manager.status(team_id), ensure_ascii=False)
 
 
+# ---------------------------------------------------------------------------
+# teammate_steer — mid-run steering (pi-subagents parity)
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    name="teammate_steer",
+    description=(
+        "Steer a running teammate mid-turn: inject a new instruction into its "
+        "next wake-up. The teammate receives a 'steer' message with your "
+        "instruction and should adjust its plan immediately. Use this to "
+        "redirect a teammate that is going off-track without killing it."
+    ),
+    params={
+        "team_id": {"type": "string", "description": "Team id."},
+        "name": {"type": "string", "description": "Teammate name to steer."},
+        "instruction": {"type": "string", "description": "New instruction / correction."},
+    },
+    required=["team_id", "name", "instruction"],
+)
+async def teammate_steer(team_id: str, name: str, instruction: str) -> str:
+    manager = _get_manager()
+    if not instruction.strip():
+        raise ToolError("instruction is required")
+    from opensquilla.teammate.protocol import TYPE_STEER, FIELD_INSTRUCTION
+
+    body: dict[str, Any] = {"type": TYPE_STEER, FIELD_INSTRUCTION: instruction}
+    envelope = manager.send_message(team_id, name, body, sender="team-lead")
+    return json.dumps(
+        {"steered": True, "to": name, "timestamp": envelope.timestamp},
+        ensure_ascii=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# teammate_parallel — fan-out (pi-subagents parallel)
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    name="teammate_parallel",
+    description=(
+        "Fan-out: spawn or reuse teammates and assign each one task in parallel. "
+        "Each entry in 'tasks' needs name + prompt + description; existing "
+        "members are reused, missing members are spawned. Returns the team_id "
+        "and per-task assignment results. This is the primary parallel "
+        "orchestration primitive (mirrors pi-subagents parallel(n))."
+    ),
+    params={
+        "team_id": {"type": "string", "description": "Existing team id."},
+        "tasks": {
+            "type": "array",
+            "description": "Array of {name, title, description, prompt?, model?, context?}.",
+        },
+    },
+    required=["team_id", "tasks"],
+)
+async def teammate_parallel(team_id: str, tasks: list[dict[str, Any]]) -> str:
+    manager = _get_manager()
+    team = manager.registry.get_team(team_id)
+    if team is None:
+        raise ToolError(f"no team '{team_id}'")
+    if not isinstance(tasks, list) or not tasks:
+        raise ToolError("tasks must be a non-empty array")
+    from opensquilla.teammate.protocol import TYPE_TASK_ASSIGNMENT, FIELD_TASK_ID, FIELD_SUBJECT, FIELD_DESCRIPTION, FIELD_ASSIGNEE, FIELD_ASSIGNED_BY
+
+    board = _board(manager, team_id)
+    results: list[dict[str, Any]] = []
+    for entry in tasks:
+        if not isinstance(entry, dict):
+            raise ToolError("each task must be an object")
+        name = str(entry.get("name") or "").strip()
+        title = str(entry.get("title") or entry.get("subject") or "").strip()
+        description = str(entry.get("description") or "").strip()
+        prompt = str(entry.get("prompt") or "").strip()
+        model = entry.get("model")
+        context = str(entry.get("context") or "").strip()
+        if not name:
+            raise ToolError("each task needs 'name'")
+        if not title:
+            raise ToolError("each task needs 'title'")
+        if not description:
+            raise ToolError("each task needs 'description'")
+        # Ensure teammate exists
+        member = team.member(name)
+        if member is None:
+            if not prompt:
+                prompt = f"You are {name}, a general-purpose teammate."
+            manager.spawn_teammate(team_id, name, prompt, model=model if isinstance(model, str) else None)
+            team = manager.registry.get_team(team_id)  # refresh
+        full = description if not context else f"{description}\n\nCONTEXT:\n{context}"
+        task = board.create(title=title, description=full, created_by="team-lead", assignee=name)
+        body = {
+            "type": TYPE_TASK_ASSIGNMENT,
+            FIELD_TASK_ID: task.id,
+            FIELD_SUBJECT: title,
+            FIELD_DESCRIPTION: full,
+            FIELD_ASSIGNEE: name,
+            FIELD_ASSIGNED_BY: "team-lead",
+        }
+        manager.send_message(team_id, name, body, sender="team-lead")
+        results.append({"name": name, "task_id": task.id, "title": title})
+    return json.dumps({"team_id": team_id, "assignments": results}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# teammate_agents — custom agent types discovery
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    name="teammate_agents",
+    description=(
+        "List available custom agent types (.opensquilla/agents/*.md). "
+        "Scans project (.opensquilla/agents) and user (~/.opensquilla/agents) scopes. "
+        "Use the returned 'name' as agent_type when spawning teammates."
+    ),
+    params={
+        "scope": {
+            "type": "string",
+            "description": "project | user | all (default all)",
+            "enum": ["project", "user", "all"],
+        },
+    },
+    required=[],
+)
+async def teammate_agents(scope: str = "all") -> str:
+    import re
+    from pathlib import Path
+
+    roots: list[Path] = []
+    if scope in ("project", "all"):
+        # Walk up from cwd to find .opensquilla/agents
+        cur = Path.cwd()
+        for _ in range(6):
+            cand = cur / ".opensquilla" / "agents"
+            if cand.is_dir():
+                roots.append(cand)
+                break
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        # Also check workspace root via state_dir parent
+        try:
+            from opensquilla.paths import state_dir
+
+            alt = Path(state_dir()).parent / "agents"
+            if alt.is_dir() and alt not in roots:
+                roots.append(alt)
+        except Exception:
+            pass
+    if scope in ("user", "all"):
+        home_agents = Path.home() / ".opensquilla" / "agents"
+        if home_agents.is_dir() and home_agents not in roots:
+            roots.append(home_agents)
+
+    agents: list[dict[str, Any]] = []
+    for root in roots:
+        for md in sorted(root.glob("*.md")):
+            try:
+                text = md.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            # Frontmatter: ---\nname: foo\ndescription: bar\nmodel: x\n---\n
+            fm: dict[str, str] = {}
+            if text.startswith("---"):
+                end = text.find("\n---", 3)
+                if end != -1:
+                    for line in text[3:end].splitlines():
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            fm[k.strip().lower()] = v.strip().strip('"').strip("'")
+            name = fm.get("name") or md.stem
+            desc = fm.get("description") or text.strip().splitlines()[0][:120] if text.strip() else ""
+            # Strip markdown heading
+            desc = re.sub(r"^#+\s*", "", desc).strip()
+            agents.append(
+                {
+                    "name": name,
+                    "description": desc,
+                    "model": fm.get("model") or None,
+                    "path": str(md),
+                }
+            )
+    return json.dumps(agents, ensure_ascii=False)
+
+
+# ── pipeline (serial orchestration) ──────────────────────────────────
+
+
+@tool(
+    name="teammate_pipeline",
+    description=(
+        "Serial pipeline: assign tasks to teammates in order, each task's "
+        "description can reference the previous task's output via {{prev_output}} "
+        "placeholder. Tasks run in the order given; the pipeline returns "
+        "all assignments. For parallel fan-out use teammate_parallel."
+    ),
+    params={
+        "team_id": {"type": "string", "description": "Existing team id."},
+        "tasks": {
+            "type": "array",
+            "description": "Array of {name, title, description, prompt?, model?, context?}.",
+        },
+    },
+    required=["team_id", "tasks"],
+)
+async def teammate_pipeline(team_id: str, tasks: list[dict[str, Any]]) -> str:
+    manager = _get_manager()
+    team = manager.registry.get_team(team_id)
+    if team is None:
+        raise ToolError(f"no team '{team_id}'")
+    if not isinstance(tasks, list) or not tasks:
+        raise ToolError("tasks must be a non-empty array")
+    from opensquilla.teammate.protocol import TYPE_TASK_ASSIGNMENT, FIELD_TASK_ID, FIELD_SUBJECT, FIELD_DESCRIPTION, FIELD_ASSIGNEE, FIELD_ASSIGNED_BY
+
+    board = _board(manager, team_id)
+    results: list[dict[str, Any]] = []
+    for entry in tasks:
+        if not isinstance(entry, dict):
+            raise ToolError("each task must be an object")
+        name = str(entry.get("name") or "").strip()
+        title = str(entry.get("title") or "").strip()
+        description = str(entry.get("description") or "").strip()
+        prompt = str(entry.get("prompt") or "").strip()
+        model = entry.get("model")
+        if not name or not title or not description:
+            raise ToolError("each task needs 'name', 'title', 'description'")
+        member = team.member(name)
+        if member is None:
+            if not prompt:
+                prompt = f"You are {name}, a general-purpose teammate."
+            manager.spawn_teammate(team_id, name, prompt, model=model if isinstance(model, str) else None)
+            team = manager.registry.get_team(team_id)
+        task = board.create(title=title, description=description, created_by="team-lead", assignee=name)
+        body = {
+            "type": TYPE_TASK_ASSIGNMENT,
+            FIELD_TASK_ID: task.id,
+            FIELD_SUBJECT: title,
+            FIELD_DESCRIPTION: description,
+            FIELD_ASSIGNEE: name,
+            FIELD_ASSIGNED_BY: "team-lead",
+        }
+        manager.send_message(team_id, name, body, sender="team-lead")
+        results.append({"name": name, "task_id": task.id, "title": title, "seq": len(results)})
+    return json.dumps({"team_id": team_id, "pipeline": results}, ensure_ascii=False)
+
+
 # ── helpers ────────────────────────────────────────────────────────────
+
+def _resolve_agent_type(agent_type: str) -> dict[str, Any] | None:
+    """Resolve a custom agent type from .opensquilla/agents/*.md."""
+    import re
+    from pathlib import Path
+
+    name = str(agent_type or "").strip()
+    if not name:
+        return None
+    candidates: list[Path] = []
+    # project scope
+    cur = Path.cwd()
+    for _ in range(6):
+        cand = cur / ".opensquilla" / "agents" / f"{name}.md"
+        if cand.is_file():
+            candidates.append(cand)
+            break
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    # user scope
+    home = Path.home() / ".opensquilla" / "agents" / f"{name}.md"
+    if home.is_file() and home not in candidates:
+        candidates.append(home)
+    if not candidates:
+        return None
+    try:
+        text = candidates[0].read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    fm: dict[str, str] = {}
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            for line in text[3:end].splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    fm[k.strip().lower()] = v.strip().strip('"').strip("'")
+            body = text[end + 4 :].strip()
+    return {"prompt": body.strip() or text.strip(), "model": fm.get("model")}
 
 
 def _board(manager: Any, team_id: str):
