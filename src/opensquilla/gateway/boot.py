@@ -688,6 +688,10 @@ class ServiceContainer:
     # Deferred teammate→lead event emitter, filled by start_gateway_server once
     # the EventBridge exists (the sink closure lives in build_services).
     _teammate_event_emit: list[Callable[..., Any]] = field(default_factory=list)
+    # Deferred teammate completion wake manager (TeammateCompletionWakeManager),
+    # filled by build_services and hot-wired with task_runtime in
+    # start_gateway_server (stub 期保持 None，静默跳过唤醒).
+    _teammate_completion_wake: Any = None
     daily_usage_telemetry_task: asyncio.Task[Any] | None = field(default=None, repr=False)
     deferred_warmups: list[Callable[[], Any]] = field(default_factory=list)
     deferred_warmup_task: asyncio.Task[Any] | None = field(default=None, repr=False)
@@ -871,6 +875,12 @@ class ServiceContainer:
             except Exception:
                 pass
             self.teammate_runtime = None
+        if self._teammate_completion_wake is not None:
+            try:
+                await self._teammate_completion_wake.close()
+            except Exception:
+                pass
+            self._teammate_completion_wake = None
 
         if self.usage_event_sink is not None:
             try:
@@ -1272,6 +1282,181 @@ def _task_runtime_envelope_host_execute(envelope: Any) -> bool:
     if isinstance(principal_host_execute, bool):
         return principal_host_execute
     return _task_runtime_envelope_owner(envelope)
+
+
+# ── teammate 完成通知 → lead 上下文 + 唤醒（pi-subagents 对齐）──────────
+# 成员完成任务（idle_notification 语义）时，完成通知以 role="system" +
+# provenance {"kind":"internal_system","source_tool":"teammate_completion"}
+# 追加到 lead 会话（与 subagent_completion 通知同构），并通过
+# task_runtime.send 唤醒 lead 主动汇报。同一 lead 会话 30s 窗口内的多条
+# 完成通知合并成一条唤醒消息（参考 pi-subagents GroupJoinManager 的
+# 30s join 语义）：实现刻意保持简单——一个 dict + asyncio 定时 flush。
+TEAMMATE_COMPLETION_PROVENANCE: dict[str, str] = {
+    "kind": "internal_system",
+    "source_tool": "teammate_completion",
+}
+_TEAMMATE_COMPLETION_MERGE_WINDOW_S = 30.0
+
+
+class TeammateCompletionWakeManager:
+    """同一 lead 会话 30s 窗口内多条完成通知合并成一条唤醒消息。
+
+    窗口内首条完成通知启动定时 flush；到期后把收集到的摘要合并成一条
+    通过 ``task_runtime.send`` 发给 lead（mode=followup，唤醒空闲会话）。
+    ``task_runtime`` 在 ``start_gateway_server`` 里 TaskRuntime 构建完成后
+    通过 ``wire_teammate_completion_wake`` 热插拔；stub 期（未接线）静默
+    跳过，不唤醒也不报错。
+    """
+
+    def __init__(self, window_s: float = _TEAMMATE_COMPLETION_MERGE_WINDOW_S) -> None:
+        self.window_s = window_s
+        self.task_runtime: Any = None
+        self._pending: dict[str, list[str]] = {}  # lead_session_key -> 摘要列表
+        self._timers: dict[str, asyncio.Task[Any]] = {}  # lead_session_key -> flush task
+
+    def set_task_runtime(self, task_runtime: Any) -> None:
+        """热插拔 task_runtime 引用（None = stub 期）。"""
+        self.task_runtime = task_runtime
+
+    def submit(self, lead_session_key: str, summary: str) -> None:
+        """记录一条完成通知；窗口内首条启动定时 flush。"""
+        self._pending.setdefault(lead_session_key, []).append(summary)
+        if lead_session_key in self._timers:
+            return  # 窗口仍在收集，到期统一合并成一条
+        loop = asyncio.get_running_loop()
+        self._timers[lead_session_key] = loop.create_task(
+            self._delayed_flush(lead_session_key)
+        )
+
+    async def _delayed_flush(self, lead_session_key: str) -> None:
+        try:
+            await asyncio.sleep(self.window_s)
+        except asyncio.CancelledError:
+            return
+        await self.flush(lead_session_key)
+
+    async def flush(self, lead_session_key: str) -> None:
+        """窗口到期：合并收集到的摘要，发一条唤醒消息给 lead。"""
+        self._timers.pop(lead_session_key, None)
+        summaries = self._pending.pop(lead_session_key, [])
+        if not summaries:
+            return
+        if self.task_runtime is None:
+            return  # stub 期：task_runtime 未接线 → 静默跳过
+        merged = "\n".join(summaries)
+        try:
+            await self.task_runtime.send(
+                lead_session_key,
+                merged,
+                provenance=TEAMMATE_COMPLETION_PROVENANCE,
+            )
+        except Exception:
+            log.debug("gateway.teammate_completion_wake_failed", exc_info=True)
+
+    async def close(self) -> None:
+        """服务关闭：取消未到期的合并窗口计时器。"""
+        for timer in list(self._timers.values()):
+            timer.cancel()
+        self._timers.clear()
+        self._pending.clear()
+
+
+def wire_teammate_completion_wake(svc: Any, task_runtime: Any) -> None:
+    """把 task_runtime 热插拔给 teammate 完成通知唤醒路径。
+
+    与 ``wire_teammate_llm_executor`` 同一模式：TaskRuntime 在
+    ``build_services`` 之后才构建，``start_gateway_server`` 建好后接线；
+    不可用（standalone CLI / 测试 / stub 期）时静默跳过。
+    """
+    try:
+        wake = getattr(svc, "_teammate_completion_wake", None)
+        if wake is None or task_runtime is None:
+            return
+        set_task_runtime = getattr(wake, "set_task_runtime", None)
+        if callable(set_task_runtime):
+            set_task_runtime(task_runtime)
+    except Exception:
+        log.warning("gateway.teammate_completion_wake_wire_failed", exc_info=True)
+
+
+async def route_teammate_visible_message(
+    *,
+    team_id: str,
+    from_name: str,
+    text: str,
+    notify_only: bool,
+    lead_session_key: str,
+    session_manager: Any,
+    completion: bool = True,
+    event_emit: Any | None = None,
+    completion_wake: TeammateCompletionWakeManager | None = None,
+) -> None:
+    """把一条 teammate 可见消息路由到 lead 会话（模块级，便于接线测试）。
+
+    - 完成/失败通知（``notify_only=True`` + ``completion=True``）：
+      ``role="system"`` + ``teammate_completion`` provenance 追加 lead 会话
+      （进入 LLM 上下文，与 pi-subagents 的 subagent_completion 一致），
+      并调度 30s 合并窗口唤醒（``task_runtime.send``，stub 期静默跳过）。
+    - 日常消息（``notify_only=True`` + ``completion=False``）：保持
+      ``role="teammate"`` 不变（TUI-only，上下文构建器过滤，不唤醒）。
+    - 升级消息（``notify_only=False``）：``role="user"``，直接进入上下文
+      提示 lead 决策（plan_approval_request 语义）。
+    所有路径都保留 ``session.event.teammate`` TUI 事件。
+    """
+    if completion and notify_only:
+        # 完成/失败通知：system role 进上下文 + 合并窗口唤醒。
+        role = "system"
+        provenance = TEAMMATE_COMPLETION_PROVENANCE
+    elif notify_only:
+        # 日常消息：TUI-only（上下文构建器只保留 user/assistant role）。
+        role = "teammate"
+        provenance = {"kind": "teammate_reply", "from": from_name, "notify_only": True}
+    else:
+        # 升级消息（plan_approval_request 等）：user role 提示 lead 决策。
+        role = "user"
+        provenance = {"kind": "teammate_reply", "from": from_name, "notify_only": False}
+    body = f"{from_name}: {text}"
+    # Cap per-message size so a verbose teammate reply doesn't flood the
+    # lead's transcript / context (keep the head + a tail hint).
+    MAX_TEAMMATE_VISIBLE_CHARS = 600
+    if len(body) > MAX_TEAMMATE_VISIBLE_CHARS:
+        head = body[:MAX_TEAMMATE_VISIBLE_CHARS]
+        tail_hint = text[-120:].strip()
+        if tail_hint:
+            body = f"{head}\n… [truncated, tail: …{tail_hint}]"
+        else:
+            body = f"{head}\n… [truncated]"
+    await session_manager.append_message(
+        lead_session_key,
+        role,
+        body,
+        provenance=provenance,
+    )
+    if completion and notify_only and completion_wake is not None:
+        # 完成通知 → 30s 合并窗口内唤醒 lead（task_runtime 未接线时由
+        # WakeManager 静默跳过）。
+        completion_wake.submit(lead_session_key, body)
+    if event_emit is not None:
+        try:
+            # TUI renders this text directly; cap it too so one verbose reply
+            # doesn't dominate the screen (head + tail hint, same budget).
+            event_text = text
+            if len(event_text) > 500:
+                event_text = (
+                    f"{event_text[:500]}\n… [truncated, tail: …{event_text[-100:].strip()}]"
+                )
+            await event_emit(
+                lead_session_key,
+                "session.event.teammate",
+                {
+                    "session_key": lead_session_key,
+                    "from": from_name,
+                    "text": event_text,
+                    "notify_only": notify_only,
+                },
+            )
+        except Exception:
+            log.debug("gateway.teammate_event_emit_failed", exc_info=True)
 
 
 def wire_teammate_llm_executor(svc: Any, task_runtime: Any) -> None:
@@ -2717,63 +2902,84 @@ async def build_services(
     _teammate_event_emit: list[Callable[..., Awaitable[Any]]] = []
 
     async def _teammate_visible_sink(
-        team_id: str, from_name: str, text: str, notify_only: bool = True
+        team_id: str,
+        from_name: str,
+        text: str,
+        notify_only: bool = True,
     ) -> None:
-        """Stream a teammate reply onto the team lead's visible session.
+        """把 teammate 消息流到 lead 会话（pi-subagents 对齐后的完成通知）。
 
-        ``notify_only`` replies are system-role notices: they render on the
-        lead's screen but are excluded from the lead's LLM context (the
-        context builder keeps only user/assistant roles), so the lead is not
-        woken and never auto-replies — Claude Code's idle_notification
-        semantics. Non-notify (P1 SendMessage semantics) go in as user role.
+        ``notify_only=True`` 的完成/失败通知（idle_notification 语义，含
+        summary）：以 ``role="system"`` + ``teammate_completion`` provenance
+        追加 lead 会话，使其进入 lead 的 LLM 上下文（与 subagent_completion
+        通知同构），并调度 30s 合并窗口的 ``task_runtime.send`` 唤醒 lead。
+        日常消息（``completion=False``）保持 ``role="teammate"`` 不变
+        （TUI-only：TUI 渲染，上下文构建器过滤，不唤醒）。升级消息
+        （``notify_only=False``）保持 ``role="user"``，直接提示 lead 决策。
+        核心逻辑见模块级 ``route_teammate_visible_message``。
+
+        注意：完成/失败通知不走本 sink —— 它们由 runtime 的
+        ``completion_sink`` 回调（``_teammate_completion_sink``）在
+        ``_notify_idle`` 时直接送达；本 sink 只处理日常可见消息（恒
+        ``completion=False``）。
         """
         try:
             team = _teammate_registry.get_team(team_id)
             if team is None or not team.lead_session_key:
                 return
-            # role "teammate": rendered by the TUI as a real message (colored
-            # member name + white body, Claude Code shared transcript), but
-            # excluded from the lead's LLM context — the context builder keeps
-            # only user/assistant roles, so teammates never wake the lead or
-            # pollute its context. Escalations (notify_only=False) go in as
-            # user role so the lead is actually prompted to decide.
-            role = "teammate" if notify_only else "user"
-            body = f"{from_name}: {text}"
-            await session_manager.append_message(
-                team.lead_session_key,
-                role,
-                body,
-                provenance={
-                    "kind": "teammate_reply",
-                    "from": from_name,
-                    "notify_only": notify_only,
-                },
+            await route_teammate_visible_message(
+                team_id=team_id,
+                from_name=from_name,
+                text=text,
+                notify_only=notify_only,
+                completion=False,
+                lead_session_key=team.lead_session_key,
+                session_manager=session_manager,
+                event_emit=_teammate_event_emit[0] if _teammate_event_emit else None,
+                completion_wake=_teammate_completion_wake,
             )
-            # Push a live event so the lead's TUI renders the message
-            # immediately (Claude Code shared-transcript behavior) instead of
-            # waiting for the next history refresh.
-            if _teammate_event_emit:
-                try:
-                    await _teammate_event_emit[0](
-                        team.lead_session_key,
-                        "session.event.teammate",
-                        {
-                            "session_key": team.lead_session_key,
-                            "from": from_name,
-                            "text": text,
-                            "notify_only": notify_only,
-                        },
-                    )
-                except Exception:
-                    log.debug("gateway.teammate_event_emit_failed", exc_info=True)
         except Exception:
             log.debug("gateway.teammate_visible_sink_failed", exc_info=True)
+
+    # 完成通知 → lead 上下文 + 30s 合并唤醒。task_runtime 引用在
+    # start_gateway_server 里 TaskRuntime 构建后热插拔（见
+    # wire_teammate_completion_wake）；stub 期保持 None，静默跳过。
+    _teammate_completion_wake = TeammateCompletionWakeManager()
+
+    async def _teammate_completion_sink(
+        team_id: str, member_name: str, summary: str, reason: str
+    ) -> None:
+        """runtime 完成回调：成员完成/失败 → system 注入 + 合并窗口唤醒。
+
+        TeammateRuntime 每次发出 idle_notification（turn 完成、max_turns、
+        idle 超时）都会 fire-and-forget 调本回调；这里把完成摘要以
+        ``role="system"`` + ``teammate_completion`` provenance 追加到 lead
+        会话（进入 LLM 上下文），并提交到 30s 合并窗口唤醒 lead。
+        """
+        try:
+            team = _teammate_registry.get_team(team_id)
+            if team is None or not team.lead_session_key:
+                return
+            await route_teammate_visible_message(
+                team_id=team_id,
+                from_name=member_name,
+                text=summary,
+                notify_only=True,
+                completion=True,
+                lead_session_key=team.lead_session_key,
+                session_manager=session_manager,
+                event_emit=_teammate_event_emit[0] if _teammate_event_emit else None,
+                completion_wake=_teammate_completion_wake,
+            )
+        except Exception:
+            log.debug("gateway.teammate_completion_sink_failed", exc_info=True)
 
     _teammate_runtime = TeammateRuntime(
         _teammate_manager,
         poll_interval=0.2,
         executor=_teammate_executor,
         visible_sink=_teammate_visible_sink,
+        completion_sink=_teammate_completion_sink,
     )
     from opensquilla.application.approval_queue import get_approval_queue
 
@@ -3425,6 +3631,7 @@ async def build_services(
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
     svc.teammate_runtime = _teammate_runtime
+    svc._teammate_completion_wake = _teammate_completion_wake
     # Hand the deferred teammate event emitter to start_gateway_server (it is
     # filled once EventBridge exists there; the sink closure above reads the
     # same list object).
@@ -3944,6 +4151,9 @@ async def start_gateway_server(
     # task runtime exists. Each teammate wake-up becomes a real agent turn in
     # the member's own session (independent context window / tools / agent).
     wire_teammate_llm_executor(svc, task_runtime)
+    # 把同一 TaskRuntime 热插拔给 teammate 完成通知唤醒路径：成员完成时
+    # 以 system role 进 lead 上下文并（30s 合并窗口内）唤醒 lead 主动汇报。
+    wire_teammate_completion_wake(svc, task_runtime)
     # Wire the runtime into SessionManager so kill_session can cascade-cancel.
     attach_runtime = getattr(svc.session_manager, "attach_task_runtime", None)
     if callable(attach_runtime):

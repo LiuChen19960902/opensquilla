@@ -201,11 +201,16 @@ class TeammateManager:
         """Write a typed message to a teammate's inbox."""
         handle = self.handles.get_by_agent_id(team_id, to_name)
         if handle is None:
-            team = self.registry.get_team(team_id)
-            if team is None or team.member(to_name) is None:
-                raise KeyError(f"no teammate '{to_name}' on team {team_id}")
-            # Fall back to a persisted-only mailbox (no live handle).
-            inbox = Mailbox.open(team_dir_of(self.registry, team_id), to_name)
+            if to_name == "team-lead":
+                # The lead is not a registered team member; write directly to
+                # its persisted inbox (same special case as approve_shutdown).
+                inbox = Mailbox.open(team_dir_of(self.registry, team_id), to_name)
+            else:
+                team = self.registry.get_team(team_id)
+                if team is None or team.member(to_name) is None:
+                    raise KeyError(f"no teammate '{to_name}' on team {team_id}")
+                # Fall back to a persisted-only mailbox (no live handle).
+                inbox = Mailbox.open(team_dir_of(self.registry, team_id), to_name)
         else:
             inbox = handle.mailbox
         result = inbox.send(sender, body)

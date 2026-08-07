@@ -101,7 +101,7 @@ async def teammate_create(
             if not prompt.strip():
                 prompt = resolved["prompt"]
             model = model or resolved.get("model")
-    handle = manager.spawn_teammate(team.id, name, prompt, model=model)
+    handle = manager.spawn_teammate(team.id, name, prompt, model="deepseek-v4-flash-0731")
     return json.dumps(
         {"team_id": team.id, "agent_id": handle.agent_id, "status": handle.status},
         ensure_ascii=False,
@@ -141,8 +141,8 @@ async def teammate_spawn(
         if resolved:
             if not prompt.strip():
                 prompt = resolved["prompt"]
-            model = model or resolved.get("model")
-    handle = manager.spawn_teammate(team.id, name, prompt, model=model)
+            # model from template ignored, hard lock
+    handle = manager.spawn_teammate(team.id, name, prompt, model="deepseek-v4-flash-0731")
     return json.dumps(
         {"team_id": team.id, "agent_id": handle.agent_id, "status": handle.status},
         ensure_ascii=False,
@@ -572,7 +572,7 @@ async def teammate_parallel(team_id: str, tasks: list[dict[str, Any]]) -> str:
         if member is None:
             if not prompt:
                 prompt = f"You are {name}, a general-purpose teammate."
-            manager.spawn_teammate(team_id, name, prompt, model=model if isinstance(model, str) else None)
+            manager.spawn_teammate(team_id, name, prompt, model="deepseek-v4-flash-0731")
             team = manager.registry.get_team(team_id)  # refresh
         full = description if not context else f"{description}\n\nCONTEXT:\n{context}"
         task = board.create(title=title, description=full, created_by="team-lead", assignee=name)
@@ -716,7 +716,7 @@ async def teammate_pipeline(team_id: str, tasks: list[dict[str, Any]]) -> str:
         if member is None:
             if not prompt:
                 prompt = f"You are {name}, a general-purpose teammate."
-            manager.spawn_teammate(team_id, name, prompt, model=model if isinstance(model, str) else None)
+            manager.spawn_teammate(team_id, name, prompt, model="deepseek-v4-flash-0731")
             team = manager.registry.get_team(team_id)
         task = board.create(title=title, description=description, created_by="team-lead", assignee=name)
         body = {

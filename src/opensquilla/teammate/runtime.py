@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable
 log = logging.getLogger("opensquilla.teammate.runtime")
 
 from opensquilla.engine.teammate import TeammateHandle, TeammateManager, team_dir_of
+from opensquilla.teammate.llm_executor import TURN_QUEUE_FULL
 from opensquilla.teammate.mailbox import Mailbox
 from opensquilla.teammate.protocol import (
     NOTIFY_ONLY_TYPES,
@@ -29,9 +30,11 @@ from opensquilla.teammate.protocol import (
     TYPE_MESSAGE,
     TYPE_PLAN_APPROVAL_REQUEST,
     TYPE_SHUTDOWN_REQUEST,
+    TYPE_TASK_ASSIGNMENT,
     FIELD_IDLE_REASON,
     FIELD_REQUEST_ID,
     FIELD_SUMMARY,
+    FIELD_TASK_ID,
 )
 
 # Handler: (manager, handle, message_body) -> reply text (or None).
@@ -124,6 +127,7 @@ class TeammateRuntime:
         shutdown_timeout: float | None = 30.0,
         idle_timeout: float | None = None,
         visible_sink: VisibleSink | None = None,
+        completion_sink: Any | None = None,
     ):
         self.manager = manager
         self.poll_interval = poll_interval
@@ -141,6 +145,12 @@ class TeammateRuntime:
         self.shutdown_timeout = shutdown_timeout
         self.idle_timeout = idle_timeout
         self.visible_sink = visible_sink
+        # Completion callback ``(team_id, member_name, summary, reason)`` —
+        # fired on every turn-completion idle notification (in addition to
+        # the mailbox write), so the gateway can surface member completions
+        # to the lead's LLM context and wake the lead (pi-subagents-style
+        # task notification). Optional; fire-and-forget, never awaited inline.
+        self.completion_sink = completion_sink
         self._running = False
         # Wire event-driven wake so manager.send_message() can nudge the loop.
         try:
@@ -201,6 +211,24 @@ class TeammateRuntime:
             )
 
     # ── guardrails (Claude Code-inspired) ──────────────────────────────
+    def _fire_completion_sink(
+        self, team_id: str, member_name: str, summary: str, reason: str
+    ) -> None:
+        """Fire the completion callback without blocking the poll loop.
+
+        Fire-and-forget: the sink is best-effort (the gateway surfaces the
+        completion to the lead's context/wake path) and must never stall
+        the runtime, so failures are logged and swallowed.
+        """
+        if self.completion_sink is None:
+            return
+        try:
+            asyncio.get_running_loop().create_task(
+                self.completion_sink(team_id, member_name, summary, reason)
+            )
+        except Exception:
+            log.warning("teammate.completion_sink_failed", exc_info=True)
+
     def _notify_idle(
         self, handle: TeammateHandle, team_id: str, summary: str, reason: str = "available"
     ) -> None:
@@ -219,6 +247,7 @@ class TeammateRuntime:
                 FIELD_SUMMARY: summary,
             },
         )
+        self._fire_completion_sink(team_id, handle.name, summary, reason)
 
     def _hit_max_turns(self, handle: TeammateHandle, team_id: str) -> None:
         """Teammate exceeded its turn budget: error out (``max_turns`` stop)."""
@@ -235,6 +264,7 @@ class TeammateRuntime:
                 FIELD_SUMMARY: handle.error,
             },
         )
+        self._fire_completion_sink(team_id, handle.name, handle.error, "max_turns_reached")
 
     def _enforce_shutdown_timeout(self, team_id: str) -> None:
         """Teammate stuck in ``shutting_down`` past the timeout → error.
@@ -272,6 +302,12 @@ class TeammateRuntime:
                     FIELD_IDLE_REASON: "idle_timeout",
                     FIELD_SUMMARY: f"idle >{self.idle_timeout:.1f}s, auto-shutdown",
                 },
+            )
+            self._fire_completion_sink(
+                team_id,
+                handle.name,
+                f"idle >{self.idle_timeout:.1f}s, auto-shutdown",
+                "idle_timeout",
             )
 
     async def poll_once(self, team_id: str) -> list[str]:
@@ -324,6 +360,9 @@ class TeammateRuntime:
                 continue
             self.manager.handles.update_status(handle.run_id, "running")
             turn_summary: list[str] = []
+            # Track which messages were successfully submitted to executor
+            # so we can requeue only the failed tail on exception (Bug3 fix).
+            processed_count = 0
             try:
                 for message in messages:
                     # ── turn budget (Claude Code ``max_turns``) ─────────
@@ -358,7 +397,35 @@ class TeammateRuntime:
                                 str(summary)[:400],
                                 True,
                             )
+                    # Bug2 fix: task_assignment arrival auto-claims taskboard
+                    # so a teammate that acks without calling teammate_task_update
+                    # still moves task from pending -> in_progress.
+                    try:
+                        body = _decode_body(message)
+                        if body.get("type") == TYPE_TASK_ASSIGNMENT:
+                            task_id = body.get(FIELD_TASK_ID) or body.get("taskId")
+                            if task_id:
+                                from opensquilla.teammate.taskboard import TaskBoard
+
+                                tb = TaskBoard(team_dir_of(self.manager.registry, team_id) / "tasks.json")
+                                try:
+                                    tb.claim(str(task_id), assignee=handle.name)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     reply = await self.executor.run_turn(self.manager, handle, message)
+                    if reply is TURN_QUEUE_FULL:
+                        # Backpressure: session pending queue full. Coalesce the failed
+                        # and trailing messages into one queued envelope (pi-subagents
+                        # style: one turn per session, [QUEUED TEAM MESSAGE] separated).
+                        # The teammate stays alive; the next poll retries the merged
+                        # message as a single turn.
+                        try:
+                            mailbox.merge_messages(messages[processed_count:])
+                        except Exception:
+                            pass
+                        break
                     if reply:
                         replies.append(f"{handle.name}: {reply}")
                         turn_summary.append(reply)
@@ -370,7 +437,16 @@ class TeammateRuntime:
                         await self._route_reply(
                             team_id, handle, reply, reply_to, source_message=message
                         )
+                    processed_count += 1
             except Exception as exc:  # pragma: no cover - defensive
+                # Bug3 fix: messages already marked read before try; requeue
+                # the failed tail so it is not permanently lost.
+                try:
+                    failed = messages[processed_count:]
+                    if failed:
+                        mailbox.requeue(failed)
+                except Exception:
+                    pass
                 handle.error = str(exc)
                 handle.stop_reason = "handler_error"
                 self.manager.handles.update_status(handle.run_id, "error")

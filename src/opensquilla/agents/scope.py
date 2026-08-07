@@ -129,11 +129,17 @@ def resolve_agent_model(
 
     Precedence is explicit call override, persisted session model, then the
     durable agent registry default from ``config.agents``.
+
+    Hard lock: all non-main agents (subagents, teammates) are forced to
+    deepseek-v4-flash-0731 regardless of config or previous session model.
     """
+    normalized = normalize_agent_id(agent_id)
+    if normalized != "main":
+        return "deepseek-v4-flash-0731"
     return (
         _string_value(explicit_model)
         or _string_value(session_model)
-        or _configured_agent_model(config, normalize_agent_id(agent_id))
+        or _configured_agent_model(config, normalized)
     )
 
 

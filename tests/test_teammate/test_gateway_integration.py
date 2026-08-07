@@ -214,6 +214,39 @@ def test_runtime_visible_sink_streams_replies_to_lead(tmp_path: Path) -> None:
     assert seen[0][3] is True
 
 
+def test_runtime_completion_sink_fires_on_idle(tmp_path: Path) -> None:
+    """成员完成任务（idle 通知）→ completion_sink 被触发（pi-subagents 风格完成通知的 runtime 侧）。"""
+    manager, runtime = _world(tmp_path)
+    seen: list[tuple[str, str, str, str]] = []
+
+    async def sink(team_id: str, member: str, summary: str, reason: str) -> None:
+        seen.append((team_id, member, summary, reason))
+
+    runtime.completion_sink = sink
+    team, alice = _spawn(manager, "alice")
+    manager.send_message(
+        team.id, "alice", {"type": TYPE_TASK_ASSIGNMENT, "taskId": "1", "subject": "job"}
+    )
+    asyncio.run(runtime.poll_once(team.id))
+    assert seen, "成员完成任务后 completion_sink 应被触发"
+    assert seen[0][0] == team.id
+    assert seen[0][1] == "alice"
+    assert "ack" in seen[0][2]  # stub executor 的回复被作为完成摘要
+    assert seen[0][3] == "available"
+
+
+def test_runtime_completion_sink_missing_is_noop(tmp_path: Path) -> None:
+    """未接 completion_sink 时原有行为不变（mailbox idle_notification 照常）。"""
+    manager, runtime = _world(tmp_path)
+    team, alice = _spawn(manager, "alice")
+    manager.send_message(
+        team.id, "alice", {"type": TYPE_TASK_ASSIGNMENT, "taskId": "1", "subject": "job"}
+    )
+    asyncio.run(runtime.poll_once(team.id))
+    inbox = Mailbox.open(team_dir_of(manager.registry, team.id), "team-lead")
+    assert any(m.type == TYPE_IDLE_NOTIFICATION for m in inbox.peek())
+
+
 def test_lateral_communication_reply_routes_to_peer(tmp_path: Path) -> None:
     """能力7：teammate → teammate 横向沟通。
 

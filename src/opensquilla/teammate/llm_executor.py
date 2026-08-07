@@ -31,6 +31,7 @@ from typing import Any
 
 from opensquilla.engine.teammate import TeammateHandle, TeammateManager
 from opensquilla.gateway.routing import build_subagent_route_envelope
+from opensquilla.gateway.task_runtime import TaskQueueFullError
 from opensquilla.session.models import AgentTaskStatus
 from opensquilla.teammate.mailbox import MailboxMessage
 from opensquilla.teammate.protocol import (
@@ -50,6 +51,9 @@ from opensquilla.teammate.protocol import (
 )
 
 log = logging.getLogger("opensquilla.teammate.llm_executor")
+
+# Sentinel returned by run_turn when the task queue is full (backpressure).
+TURN_QUEUE_FULL = object()
 
 TERMINAL_OK = frozenset({AgentTaskStatus.SUCCEEDED})
 TERMINAL_BAD = frozenset(
@@ -124,7 +128,7 @@ class TeammateLLMExecutor:
         self.task_runtime = task_runtime
         self.session_manager = session_manager
         self.turn_timeout_s = turn_timeout_s
-        self._pending: dict[str, _PendingTurn] = {}
+        self._pending: dict[str, list[_PendingTurn]] = {}
 
     # ── TeammateExecutor protocol ─────────────────────────────────────
     async def run_turn(
@@ -179,17 +183,23 @@ class TeammateLLMExecutor:
             run_id=uuid.uuid4().hex,
             origin="teammate",
         )
-        task = await self.task_runtime.enqueue(
-            envelope,
-            text,
-            mode="followup",
-            run_kind="teammate",
-        )
-        self._pending[handle.run_id] = _PendingTurn(
-            handle=handle,
-            message=message,
-            task_id=task.task_id,
-            submitted_at=time.monotonic(),
+        try:
+            task = await self.task_runtime.enqueue(
+                envelope,
+                text,
+                mode="followup",
+                run_kind="teammate",
+            )
+        except TaskQueueFullError:
+            log.warning("teammate.queue_full_backoff session=%s", handle.session_key)
+            return TURN_QUEUE_FULL
+        self._pending.setdefault(handle.run_id, []).append(
+            _PendingTurn(
+                handle=handle,
+                message=message,
+                task_id=task.task_id,
+                submitted_at=time.monotonic(),
+            )
         )
         return None
 
@@ -199,10 +209,16 @@ class TeammateLLMExecutor:
     ) -> list[CompletedTurn]:
         """Return finished turns for this team; drop stale/errored ones."""
         done: list[CompletedTurn] = []
-        for run_id, pending in list(self._pending.items()):
-            handle = pending.handle
+        for run_id, pending_list in list(self._pending.items()):
+            if not pending_list:
+                continue
+            handle = pending_list[0].handle
             if handle.team_id != team_id:
                 continue
+            # Process queue head-first: only the oldest pending for this handle
+            # is checked each poll; later items wait for head to complete,
+            # preserving order and preventing overwrite loss (卡死 fix).
+            pending = pending_list[0]
             try:
                 record = await self.task_runtime.status(pending.task_id)
             except Exception:
@@ -211,7 +227,9 @@ class TeammateLLMExecutor:
 
             if status in TERMINAL_OK:
                 reply = await self._extract_reply(handle.session_key)
-                self._pending.pop(run_id, None)
+                pending_list.pop(0)
+                if not pending_list:
+                    self._pending.pop(run_id, None)
                 reply_to = getattr(pending.message, "from_name", None) or "team-lead"
                 done.append(
                     CompletedTurn(
@@ -222,7 +240,9 @@ class TeammateLLMExecutor:
                     )
                 )
             elif status in TERMINAL_BAD:
-                self._pending.pop(run_id, None)
+                pending_list.pop(0)
+                if not pending_list:
+                    self._pending.pop(run_id, None)
                 reason = record.terminal_reason or record.error_message or status.value
                 done.append(
                     CompletedTurn(
@@ -260,7 +280,8 @@ class TeammateLLMExecutor:
 
     def has_pending(self, handle: TeammateHandle) -> bool:
         """True while an async turn for ``handle`` is still in flight."""
-        return handle.run_id in self._pending
+        pending = self._pending.get(handle.run_id)
+        return bool(pending)
 
 
 def _member_system_prompt(manager: TeammateManager, handle: TeammateHandle) -> str:

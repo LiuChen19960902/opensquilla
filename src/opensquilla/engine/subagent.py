@@ -134,13 +134,14 @@ def resolve_subagent_execution_target(
         configured_provider_id(parent_provider)
         or str(getattr(parent_config, "provider_id", "") or "").strip()
     )
-    requested_model = str(requested_model_id or "").strip()
+    # Hard lock: all subagents forced to deepseek-v4-flash-0731
+    requested_model = "deepseek-v4-flash-0731"
     configured_model = str(getattr(parent_config, "model_id", "") or "").strip()
     parent_model = (
         str(metadata.model or "").strip()
         or configured_model
     )
-    model_id = requested_model or parent_model
+    model_id = requested_model
 
     if requested_model and not provider_id:
         raise ValueError(
