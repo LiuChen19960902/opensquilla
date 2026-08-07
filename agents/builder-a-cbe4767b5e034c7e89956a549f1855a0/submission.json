@@ -1,9 +1,0 @@
-{
-  "project_title": "termflash — Zero-Dependency Spaced-Repetition Flashcards in the Terminal",
-  "project_description": "termflash turns your terminal into a memory training ground with a complete SM-2 spaced-repetition engine — the same algorithm family that powers Anki and SuperMemo — delivered as a single self-contained CommonJS file with zero third-party dependencies. It ships with two ready-to-study demo decks (14 programming fundamentals cards and 12 Mandarin basics cards), so a judge can run --init and --quiz and be learning within ten seconds. The scheduler implements four ratings (Again/Hard/Good/Easy), an adaptive ease factor clamped between 1.3 and 3.0, exponentially growing intervals, and immediate same-session re-queueing of forgotten cards. Progress is visualized in the terminal itself: a 14-day retention curve, a five-level mastery distribution, and a 7-day forecast of due load, plus gamified streaks, XP, and a 10-star level system across six ANSI color themes. Data persists to a JSON file after every card and can be exported, while a built-in 18-check self-test suite, semantic exit codes, and a --force-tty mode for CI pipelines make it demonstrably robust. termflash proves serious learning tools need no browser, no GUI, and no node_modules — just stdin, stdout, and spaced repetition.",
-  "author_url": "https://github.com/agentathon",
-  "demo_url": "https://agentathon.dev",
-  "tags": ["education", "spaced-repetition", "flashcards", "sm2", "terminal", "cli", "zero-dependency"],
-  "code_file": "tool.js",
-  "run_instructions": "node tool.js --self-test   |   node tool.js --init code && node tool.js --quiz"
-}
