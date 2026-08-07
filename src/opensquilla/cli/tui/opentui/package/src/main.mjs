@@ -339,12 +339,14 @@ async function main() {
   // this only adds a reference, not a copy.
   const newTurnFlow = () => createTurnFlow((id) => createTurnView(turnDeps, id ?? scrollbackSeq++));
   flow = newTurnFlow();
-  // Keyboard-only access to expanded thinking/tool detail without transferring
-  // focus away from the composer.
+  // Keyboard-only access to thinking/tool detail without transferring focus
+  // away from the composer. Ctrl+O cycles the three detail states
+  // (detailed → collapsed → hidden → detailed); Shift+Ctrl+O walks backwards.
   renderer.keyInput.on?.("keypress", (key) => {
     if (!key?.ctrl || key?.name !== "o" || overlayLayer.visible) return;
     transcriptScroller.restore(() => {
-      flow.toggleDetails();
+      if (key.shift) flow.cycleDetailsModeBack?.() ?? flow.setDetailsMode?.("detailed");
+      else flow.cycleDetailsMode();
       renderer.requestRender?.();
     });
   });

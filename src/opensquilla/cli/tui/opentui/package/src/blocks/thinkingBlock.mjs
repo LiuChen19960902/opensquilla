@@ -17,6 +17,7 @@ export function createThinkingBlock(ctx) {
   let rawText = "";
   let done = false;
   let expanded = false;
+  let hidden = false;
   const rowNodes = [];
   let summaryNode = null;
   let hiddenLineCount = 0;
@@ -46,6 +47,21 @@ export function createThinkingBlock(ctx) {
     const firstPrefix = `${TOOL_INDENT}✻ `;
     const contPrefix = `${TOOL_INDENT}  `;
     const avail = timelineAvailCells(firstPrefix, contentWidth());
+    // Fully-folded state: zero rows — the thinking process leaves no trace on
+    // screen. rawText is retained so unhide can rebuild everything, including
+    // narration that streams in while hidden.
+    if (hidden) {
+      while (rowNodes.length) {
+        const node = rowNodes.pop();
+        destroyRenderable(box, node);
+      }
+      if (summaryNode) {
+        destroyRenderable(box, summaryNode);
+        summaryNode = null;
+      }
+      hiddenLineCount = 0;
+      return;
+    }
     while (rowNodes.length > rows.length) {
       const node = rowNodes.pop();
       destroyRenderable(box, node);
@@ -97,9 +113,25 @@ export function createThinkingBlock(ctx) {
   function toggleExpanded(force) {
     const next = typeof force === "boolean" ? force : !expanded;
     if (next === expanded) return expanded;
+    if (next && hidden) hidden = false;
     expanded = next;
     render();
     return expanded;
+  }
+
+  // Three-state detail mode: "detailed" (expanded), "collapsed" (bounded
+  // preview), "hidden" (fully folded, zero rows). Kept as a separate entry
+  // point so toggleExpanded keeps its boolean contract for existing callers.
+  function setDetailsMode(mode) {
+    if (mode === "hidden") {
+      hidden = true;
+      expanded = false;
+    } else {
+      hidden = false;
+      expanded = mode === "detailed";
+    }
+    render();
+    return mode;
   }
 
   return {
@@ -137,6 +169,7 @@ export function createThinkingBlock(ctx) {
       render();
     },
     toggleExpanded,
+    setDetailsMode,
     // Re-wrap every row from the raw text at the current terminal width, so a
     // resize re-flows narration instead of leaving rows wrapped or clipped to
     // the old width.

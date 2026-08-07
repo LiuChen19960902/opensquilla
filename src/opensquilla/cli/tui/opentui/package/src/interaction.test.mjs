@@ -416,6 +416,11 @@ function stubFlow() {
       this.detailCalls.push(this.detailsExpanded);
       return this.detailsExpanded;
     },
+    setDetailsMode(mode) {
+      this.detailsExpanded = mode === "detailed";
+      this.detailCalls.push(mode);
+      return mode;
+    },
     refreshContext() { this.refreshCalls += 1; },
   }));
   return flow;

@@ -15,6 +15,26 @@ import { rendererViewportSnapshot } from "./screenMode.mjs";
 // trailing kind (usage) closes it.
 const OUT_OF_CARD_KINDS = new Set(["prompt", "usage", "teammate"]);
 const DETAIL_KINDS = new Set(["thinking", "reasoning", "tool", "ensemble"]);
+// Only thinking + reasoning carry a third "hidden" (fully folded) state: the
+// user asked to hide the thinking PROCESS. tool/ensemble keep their existing
+// two-state behavior, so a hidden mode degrades to collapsed for them.
+const THINKING_KINDS = new Set(["thinking", "reasoning"]);
+// Three-state detail mode (session-level default is "collapsed"):
+//   "detailed"  → expanded=true  (full payload)
+//   "collapsed" → expanded=false (bounded preview / bounded live tail)
+//   "hidden"    → expanded=false + thinking/reasoning blocks fully folded
+const DETAIL_MODE_DEFAULT = "collapsed";
+// The three detail modes. The ring is detailed → collapsed → hidden → detailed
+// (Ctrl+O). The default session state is "collapsed"; its FIRST press expands
+// (preserving the two-state muscle memory), and every later press follows the
+// strict ring (collapsed → hidden → detailed → collapsed).
+const DETAIL_MODES = ["detailed", "collapsed", "hidden"];
+
+// Ctrl+O forward ring (after the initial expand from the default collapsed
+// state): detailed → collapsed → hidden → detailed.
+const DETAIL_CYCLE_FORWARD = { collapsed: "hidden", detailed: "collapsed", hidden: "detailed" };
+// Shift+Ctrl+O backward: detailed → hidden → collapsed → detailed.
+const DETAIL_CYCLE_BACKWARD = { detailed: "hidden", hidden: "collapsed", collapsed: "detailed" };
 
 export function isOutOfCardKind(kind) {
   return OUT_OF_CARD_KINDS.has(kind);
@@ -85,6 +105,7 @@ export function createTurnView(deps, id) {
   let cardCancelled = false;
   let turnFinished = false;
   let detailsExpanded = false;
+  let detailsMode = DETAIL_MODE_DEFAULT;
   let lastInCardKind = null; // for prose<->procedure spacing inside the card
   let gapSeq = 0;
   let lastRelayoutWidth = contentWidth(); // block content is clipped at this width
@@ -205,15 +226,53 @@ export function createTurnView(deps, id) {
     };
   }
 
+  // Boolean alias kept for existing callers (tests, protocol patches): true
+  // → detailed, false → collapsed. The third state is only reachable through
+  // setDetailsMode/cycleDetailsMode.
   function setDetailsExpanded(value) {
-    detailsExpanded = Boolean(value);
-    for (const entry of blocks.values()) {
-      if (DETAIL_KINDS.has(entry.kind)) entry.r.toggleExpanded?.(detailsExpanded);
-    }
-    renderer.requestRender?.();
-    return detailsExpanded;
+    setDetailsMode(Boolean(value) ? "detailed" : "collapsed");
+    return detailsExpanded; // boolean contract for existing callers
   }
 
+  function setDetailsMode(mode) {
+    const next = DETAIL_MODES.includes(mode) ? mode : DETAIL_MODE_DEFAULT;
+    detailsMode = next;
+    detailsExpanded = next === "detailed";
+    for (const entry of blocks.values()) {
+      if (!DETAIL_KINDS.has(entry.kind)) continue;
+      // Only thinking + reasoning carry the third hidden state; tool/ensemble
+      // stay two-state, so hidden degrades to collapsed for them.
+      const blockMode = THINKING_KINDS.has(entry.kind) && next === "hidden" ? "hidden" : next;
+      if (typeof entry.r.setDetailsMode === "function") {
+        entry.r.setDetailsMode(blockMode);
+      } else {
+        // tool/ensemble (and any future DETAIL block without the three-state
+        // API) keep their boolean two-state toggle.
+        entry.r.toggleExpanded?.(next === "detailed");
+      }
+    }
+    renderer.requestRender?.();
+    return next;
+  }
+
+  let enteredRing = false; // first press from the default collapsed state expands
+  function cycleDetailsMode() {
+    if (detailsMode === "collapsed" && !enteredRing) {
+      enteredRing = true;
+      return setDetailsMode("detailed");
+    }
+    enteredRing = true;
+    return setDetailsMode(DETAIL_CYCLE_FORWARD[detailsMode] ?? "collapsed");
+  }
+
+  function cycleDetailsModeBack() {
+    enteredRing = true;
+    return setDetailsMode(DETAIL_CYCLE_BACKWARD[detailsMode] ?? "collapsed");
+  }
+
+  // Two-state toggle preserved as a boolean API for existing callers/protocol:
+  // true → detailed, false → collapsed. The hidden state is only reachable via
+  // cycleDetailsMode / setDetailsMode("hidden").
   function toggleDetails() {
     return setDetailsExpanded(!detailsExpanded);
   }
@@ -384,6 +443,9 @@ export function createTurnView(deps, id) {
     // available for future mouse/focus affordances and deterministic tests.
     setDetailsExpanded,
     toggleDetails,
+    setDetailsMode,
+    cycleDetailsMode,
+    cycleDetailsModeBack,
     refreshContext,
     layoutTop() {
       return Math.max(0, Number(yogaRect(box)?.top) || 0);
@@ -394,6 +456,7 @@ export function createTurnView(deps, id) {
     anchorAtRow: anchorAtLocalRow,
     rowForAnchor: localRowForAnchor,
     get detailsExpanded() { return detailsExpanded; },
+    get detailsMode() { return detailsMode; },
     blockState(blockId) {
       const entry = blocks.get(blockId);
       if (!entry) return null;
@@ -420,11 +483,11 @@ export function createTurnFlow(newView) {
   const anchorAliasesById = new Map();
   const promptsByClientMessageId = new Map();
   let active = null;
-  let detailsExpanded = false;
+  let detailsMode = DETAIL_MODE_DEFAULT;
 
   function create(id) {
     const view = newView(id);
-    view.setDetailsExpanded?.(detailsExpanded);
+    view.setDetailsMode?.(detailsMode);
     turns.push(view);
     if (id !== undefined && id !== null && String(id)) {
       turnsById.set(String(id), view);
@@ -464,14 +527,40 @@ export function createTurnFlow(newView) {
     return active;
   }
 
+  // Boolean alias kept for existing callers: true → detailed, false →
+  // collapsed. The third state is only reachable through setDetailsMode /
+  // cycleDetailsMode (same contract as the per-turn view).
   function setDetailsExpanded(value) {
-    detailsExpanded = Boolean(value);
-    for (const view of turns) view.setDetailsExpanded?.(detailsExpanded);
-    return detailsExpanded;
+    setDetailsMode(Boolean(value) ? "detailed" : "collapsed");
+    return detailsMode === "detailed"; // boolean contract for existing callers
+  }
+
+  function setDetailsMode(mode) {
+    const next = DETAIL_MODES.includes(mode) ? mode : DETAIL_MODE_DEFAULT;
+    detailsMode = next;
+    for (const view of turns) view.setDetailsMode?.(next);
+    return next;
+  }
+
+  let enteredRing = false; // first press from the default collapsed state expands
+  function cycleDetailsMode() {
+    if (detailsMode === "collapsed" && !enteredRing) {
+      enteredRing = true;
+      return setDetailsMode("detailed");
+    }
+    enteredRing = true;
+    return setDetailsMode(DETAIL_CYCLE_FORWARD[detailsMode] ?? "collapsed");
+  }
+
+  function cycleDetailsModeBack() {
+    enteredRing = true;
+    return setDetailsMode(DETAIL_CYCLE_BACKWARD[detailsMode] ?? "collapsed");
   }
 
   function toggleDetails() {
-    return setDetailsExpanded(!detailsExpanded);
+    // flow level tracks detailsMode (no per-flow boolean); derive the two-state
+    // flip from it.
+    return setDetailsExpanded(detailsMode !== "detailed");
   }
 
   function refreshContext() {
@@ -580,12 +669,16 @@ export function createTurnFlow(newView) {
     ensure,
     setDetailsExpanded,
     toggleDetails,
+    setDetailsMode,
+    cycleDetailsMode,
+    cycleDetailsModeBack,
     refreshContext,
     release,
     releaseEndedViews,
     anchorAtRow,
     rowForAnchor,
-    get detailsExpanded() { return detailsExpanded; },
+    get detailsExpanded() { return detailsMode === "detailed"; },
+    get detailsMode() { return detailsMode; },
     // block.begin after turn.end is a late straggler (e.g. a trailing usage
     // line) that belongs to the turn that just ended. Routing it there keeps
     // it from spawning a fresh un-ended turn that would absorb the next

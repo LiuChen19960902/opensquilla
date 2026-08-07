@@ -1416,16 +1416,9 @@ async def route_teammate_visible_message(
         role = "user"
         provenance = {"kind": "teammate_reply", "from": from_name, "notify_only": False}
     body = f"{from_name}: {text}"
-    # Cap per-message size so a verbose teammate reply doesn't flood the
-    # lead's transcript / context (keep the head + a tail hint).
-    MAX_TEAMMATE_VISIBLE_CHARS = 600
-    if len(body) > MAX_TEAMMATE_VISIBLE_CHARS:
-        head = body[:MAX_TEAMMATE_VISIBLE_CHARS]
-        tail_hint = text[-120:].strip()
-        if tail_hint:
-            body = f"{head}\n… [truncated, tail: …{tail_hint}]"
-        else:
-            body = f"{head}\n… [truncated]"
+    # No gateway-side truncation: the stored record and the lead's LLM
+    # context keep the full text. Screen-size capping (50 chars) is done by
+    # the TUI display layer only (history.py / surface.py).
     await session_manager.append_message(
         lead_session_key,
         role,
@@ -1438,20 +1431,16 @@ async def route_teammate_visible_message(
         completion_wake.submit(lead_session_key, body)
     if event_emit is not None:
         try:
-            # TUI renders this text directly; cap it too so one verbose reply
-            # doesn't dominate the screen (head + tail hint, same budget).
-            event_text = text
-            if len(event_text) > 500:
-                event_text = (
-                    f"{event_text[:500]}\n… [truncated, tail: …{event_text[-100:].strip()}]"
-                )
+            # The event carries the full text; the TUI display layer caps it
+            # (truncate_teammate_display_body), so each display surface keeps
+            # its own truncation policy.
             await event_emit(
                 lead_session_key,
                 "session.event.teammate",
                 {
                     "session_key": lead_session_key,
                     "from": from_name,
-                    "text": event_text,
+                    "text": text,
                     "notify_only": notify_only,
                 },
             )
@@ -2960,6 +2949,16 @@ async def build_services(
             team = _teammate_registry.get_team(team_id)
             if team is None or not team.lead_session_key:
                 return
+            # A successful completion ("available") already streamed the reply
+            # via the visible_sink in runtime._route_reply — emitting the TUI
+            # event again here would duplicate the message on screen. Keep the
+            # context append + wake, but skip the display event. Error/timeout
+            # completions have no visible reply, so they keep the event.
+            event_emit = (
+                None
+                if reason == "available"
+                else (_teammate_event_emit[0] if _teammate_event_emit else None)
+            )
             await route_teammate_visible_message(
                 team_id=team_id,
                 from_name=member_name,
@@ -2968,7 +2967,7 @@ async def build_services(
                 completion=True,
                 lead_session_key=team.lead_session_key,
                 session_manager=session_manager,
-                event_emit=_teammate_event_emit[0] if _teammate_event_emit else None,
+                event_emit=event_emit,
                 completion_wake=_teammate_completion_wake,
             )
         except Exception:

@@ -34,6 +34,7 @@ export function createReasoningBlock(ctx) {
   let elapsedHintAtEnd = null;
   let done = false;
   let expanded = false;
+  let hidden = false;
   let glyph = "✻";
   let hiddenLineCount = 0;
   let waiting = false;
@@ -89,6 +90,11 @@ export function createReasoningBlock(ctx) {
     const rows = allRows();
     const prefix = `${TOOL_INDENT}  `;
     const avail = timelineAvailCells(prefix, contentWidth());
+
+    // Fully-folded state: the thinking process occupies no screen space at
+    // all. rawText is still retained so any later unhide can rebuild the
+    // complete payload (including deltas that stream in while hidden).
+    if (hidden) return [];
 
     if (expanded) {
       hiddenLineCount = 0;
@@ -152,6 +158,23 @@ export function createReasoningBlock(ctx) {
   }
 
   function renderDetails() {
+    // Fully-folded state: tear the whole block (header marker + detail rows)
+    // down so a hidden thinking process takes zero rows. This mirrors the
+    // existing "sub-second silent wait" teardown below; unhide calls the
+    // normal path again, which rebuilds everything from rawText.
+    if (hidden) {
+      while (detailNodes.length) {
+        const node = detailNodes.pop();
+        destroyRenderable(box, node);
+      }
+      if (header) {
+        destroyRenderable(box, header);
+        header = null;
+      }
+      hiddenLineCount = 0;
+      renderer.requestRender?.();
+      return;
+    }
     // A sub-second silent wait is useful while it is happening but becomes
     // visual noise once another block arrives. Remove that transient row
     // completely; longer silent waits retain the honest "Worked for Ns"
@@ -206,9 +229,25 @@ export function createReasoningBlock(ctx) {
   function toggleExpanded(force) {
     const next = typeof force === "boolean" ? force : !expanded;
     if (next === expanded) return expanded;
+    if (next && hidden) hidden = false;
     expanded = next;
     renderDetails();
     return expanded;
+  }
+
+  // Three-state detail mode: "detailed" (expanded), "collapsed" (bounded
+  // preview), "hidden" (fully folded, zero rows). Kept as a separate entry
+  // point so toggleExpanded keeps its boolean contract for existing callers.
+  function setDetailsMode(mode) {
+    if (mode === "hidden") {
+      hidden = true;
+      expanded = false;
+    } else {
+      hidden = false;
+      expanded = mode === "detailed";
+    }
+    renderDetails();
+    return mode;
   }
 
   return {
@@ -243,6 +282,7 @@ export function createReasoningBlock(ctx) {
       if (typeof patch.expanded === "boolean") toggleExpanded(patch.expanded);
     },
     setGlyph,
+    setDetailsMode,
     end() {
       if (!done) {
         elapsedAtEnd = elapsedHintAtEnd ?? elapsedSeconds();

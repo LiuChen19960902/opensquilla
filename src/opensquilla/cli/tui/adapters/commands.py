@@ -158,7 +158,7 @@ OPENTUI_KEY_BINDINGS: tuple[KeyBinding, ...] = (
     KeyBinding("Ctrl+D", "Exit chat", ('key.ctrl && key.name === "d"',)),
     KeyBinding(
         "Ctrl+O",
-        "Expand or collapse thinking and tool details",
+        "Cycle thinking/tool details: detailed → collapsed → hidden (Shift+Ctrl+O reverses)",
         ('key?.name !== "o"',),
         js_file="main.mjs",
     ),

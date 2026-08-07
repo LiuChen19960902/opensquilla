@@ -16,6 +16,32 @@ from opensquilla.cli.tui.opentui.messages import (
 
 HISTORY_BOOTSTRAP_LIMIT = 200
 
+# Display-layer budget: teammate message bodies are capped to this many chars
+# on screen (live blocks and history replay). The stored/context form keeps
+# the full text — truncation happens only here, in the TUI projection.
+TEAMMATE_DISPLAY_BODY_CHARS = 50
+
+
+def truncate_teammate_display_body(text: str) -> str:
+    """Cap a teammate message body for screen display (50 chars, body only).
+
+    The stored form is ``"Name: body"``; the name prefix is preserved and only
+    the body is capped (appending ``…`` when cut). Text without a name prefix
+    is capped as a whole. This is display-only — session records and the
+    lead's LLM context keep the full text.
+    """
+    value = str(text or "")
+    colon = value.find(":")
+    if colon > 0:
+        name = value[:colon].strip()
+        body = value[colon + 1 :].strip()
+        if len(body) <= TEAMMATE_DISPLAY_BODY_CHARS:
+            return value
+        return f"{name}: {body[:TEAMMATE_DISPLAY_BODY_CHARS]}…"
+    if len(value) <= TEAMMATE_DISPLAY_BODY_CHARS:
+        return value
+    return f"{value[:TEAMMATE_DISPLAY_BODY_CHARS]}…"
+
 
 def history_replace_from_bootstrap(
     snapshot: dict[str, Any],
@@ -122,6 +148,9 @@ async def replace_tui_history(
 def _history_message(row: dict[str, Any], *, ordinal: int) -> HistoryMessage:
     role = str(row.get("role") or "message")
     text = _display_text(row)
+    if role == "teammate":
+        # Display-layer cap (50 chars); the stored record keeps full text.
+        text = truncate_teammate_display_body(text)
     timestamp = row.get("timestamp") if row.get("timestamp") is not None else row.get("ts")
     raw_id = row.get("message_id") or row.get("messageId") or row.get("id")
     if raw_id is None:

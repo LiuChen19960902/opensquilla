@@ -21,6 +21,7 @@ from opensquilla.cli.tui.opentui.completion import (
     enumerate_workspace_files,
 )
 from opensquilla.cli.tui.opentui.context import context_update_from_bootstrap
+from opensquilla.cli.tui.opentui.history import truncate_teammate_display_body
 from opensquilla.cli.tui.opentui.messages import (
     ApprovalDismiss,
     AttachmentClear,
@@ -162,7 +163,9 @@ class OpenTuiOutputHandle:
             BlockBegin(
                 id=block_id,
                 kind="teammate",
-                meta={"text": f"{from_name}: {text}"},
+                # Display-layer cap (50 chars); the gateway event carries the
+                # full text and session/context storage is unaffected.
+                meta={"text": truncate_teammate_display_body(f"{from_name}: {text}")},
             ),
         )
         await self._bridge.send("block.end", BlockEnd(id=block_id))
